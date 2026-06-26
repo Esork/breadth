@@ -55,7 +55,6 @@ const SYS_CONFIG = {
 
   CLOUDFLARE: {
     BASE_URL: "https://breadth-db-api.kamarski.workers.dev",
-    INGEST_TOKEN: "CHANGE_ME_LATER",
     BATCH_SIZE: 100,
     LOG_MODULE: "CF_SYNC"
   },

@@ -2,9 +2,12 @@
  * 08_DailySync.gs
  * Robust daily sync with recurring worker trigger.
  *
- * Reads eligible tickers from SYS_SYNC_INDEX:
- * IsCurrentSP500 = TRUE
- * IsActive = TRUE
+ * Reads a date-aware candidate universe:
+ * - Current S&P 500 eligible tickers
+ * - Plus known transition tickers from membership events
+ *
+ * Each fetched OHLCV row is validated against the correct S&P 500 universe
+ * for that row's actual OHLCV date.
  */
 
 var DAILY_LAST_HEALTH_PROP_KEY = 'QE_DAILY_LAST_HEALTH_V1';
@@ -15,10 +18,10 @@ function startDailySyncNow() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
   var registrySheet = getRegistrySheet_(ss);
-  var tickers = readEligibleTickerListFromRegistry_(registrySheet);
+  var tickers = readDailySyncCandidateTickerList_(registrySheet);
 
   if (tickers.length === 0) {
-    logWarn_(module, startTime, 'Eligible ticker list is empty. Daily sync not started.');
+    logWarn_(module, startTime, 'Daily sync candidate ticker list is empty. Daily sync not started.');
     return;
   }
 
@@ -31,6 +34,7 @@ function startDailySyncNow() {
     total: tickers.length,
     successCount: 0,
     duplicateCount: 0,
+    excludedCount: 0,
     skipCount: 0,
     failureCount: 0,
     startedAt: nowIso_()
@@ -49,7 +53,7 @@ function startDailySyncNow() {
   logInfo_(
     module,
     startTime,
-    'Daily sync state initialized from SYS_SYNC_INDEX. Total eligible tickers=' +
+    'Daily sync state initialized from date-aware candidate universe. Total candidates=' +
       tickers.length +
       ', worker every ' +
       SYS_CONFIG.DAILY_SYNC.WORKER_EVERY_MINUTES +
@@ -71,8 +75,10 @@ function dailySyncWorker() {
 
   try {
     runDailySyncBatch_();
+
   } catch (err) {
     logError_(module, startTime, String(err));
+
   } finally {
     lock.releaseLock();
   }
@@ -99,7 +105,7 @@ function runDailySyncBatch_() {
   var dbSheet = getDbSheet_(ss);
   var tempSheet = getBufferSheet_(ss);
 
-  var tickers = readEligibleTickerListFromRegistry_(registrySheet);
+  var tickers = readDailySyncCandidateTickerList_(registrySheet);
   var syncMap = loadSyncIndexMap_(registrySheet);
 
   var startIndex = Number(state.cursor) || 0;
@@ -112,10 +118,13 @@ function runDailySyncBatch_() {
   var skipped = [];
   var failed = [];
   var duplicates = [];
+  var excluded = [];
+  var eligibilityCache = {};
 
   var localDuplicate = 0;
   var localSkip = 0;
   var localFailure = 0;
+  var localExcluded = 0;
 
   var processedCursor = startIndex;
 
@@ -139,6 +148,10 @@ function runDailySyncBatch_() {
       if (!result.ok) {
         localSkip++;
         skipped.push(ticker + ': ' + result.message);
+
+      } else if (!isTickerEligibleForOhlcvDateCached_(registrySheet, ticker, result.dateKey, eligibilityCache)) {
+        localExcluded++;
+        excluded.push(ticker + '(' + result.dateKey + ')');
 
       } else if (isDateAlreadySynced_(syncMap[ticker] || '', result.dateKey)) {
         localDuplicate++;
@@ -180,17 +193,6 @@ function runDailySyncBatch_() {
     }
   }
 
-  /**
-   * Commit phase.
-   *
-   * Critical ordering:
-   * 1. Append DB through guarded write gate.
-   * 2. Only after append succeeds, update sync index.
-   * 3. Only after DB + sync index commit, advance cursor.
-   *
-   * This makes reruns safe: if DB append succeeds but state/index save fails,
-   * next run will be blocked by appendOhlcvRowsDetailed_ duplicate guard.
-   */
   var writeBuffer = [];
   for (var w = 0; w < writeItems.length; w++) {
     writeBuffer.push(writeItems[w].row);
@@ -235,6 +237,7 @@ function runDailySyncBatch_() {
     localDuplicate +
     appendResult.existingDuplicateRows +
     appendResult.incomingDuplicateRows;
+  state.excludedCount = Number(state.excludedCount || 0) + localExcluded;
   state.skipCount += localSkip;
   state.failureCount += localFailure;
 
@@ -251,14 +254,14 @@ function runDailySyncBatch_() {
     logError_(module, null, 'Failed: ' + failed.slice(0, 20).join(' | '));
   }
 
-  if (duplicates.length > 0) {
+  if (excluded.length > 0) {
     logInfo_(
       module,
       null,
-      'Duplicate skipped by sync index count=' +
-        duplicates.length +
+      'Excluded by date-aware universe count=' +
+        excluded.length +
         '. Examples=' +
-        duplicates.slice(0, 10).join(', ')
+        excluded.slice(0, 10).join(', ')
     );
   }
 
@@ -288,6 +291,8 @@ function runDailySyncBatch_() {
         state.successCount +
         ', Duplicates=' +
         state.duplicateCount +
+        ', Excluded=' +
+        Number(state.excludedCount || 0) +
         ', Skip=' +
         state.skipCount +
         ', Failed=' +
@@ -303,7 +308,8 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
   var module = SYS_CONFIG.DAILY_SYNC.LOG_MODULE;
   var props = PropertiesService.getScriptProperties();
 
-  var covered = state.successCount + state.duplicateCount;
+  var excludedCount = Number(state.excludedCount || 0);
+  var covered = state.successCount + state.duplicateCount + excludedCount;
   var coverageRate = totalTickers > 0
     ? (covered / totalTickers * 100).toFixed(2)
     : '0.00';
@@ -313,6 +319,10 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
 
   var cloudflarePushOk = false;
   var cloudflarePushError = null;
+
+  var cloudflareDeriveOk = false;
+  var cloudflareDeriveError = null;
+  var cloudflareDeriveResult = null;
 
   var cachePruneResult = null;
   var cachePruneError = null;
@@ -329,16 +339,14 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
     healthOk = false;
   }
 
-  /**
-   * Only push to Cloudflare if the latest OHLCV date is clean.
-   * If this fails, do NOT keep the daily sync state stuck.
-   * The cache still keeps latest 3 days, so we can manually repair with
-   * pushLatestCleanOhlcvDateToCloudflare() or pushAllCleanOhlcvCacheDatesToCloudflare().
-   */
   if (healthOk) {
     try {
       pushLatestCleanOhlcvDateToCloudflare();
       cloudflarePushOk = true;
+
+      var deriveDateKey = normalizeDateKey_(healthResult.date);
+      cloudflareDeriveResult = deriveOhlcvDateOnCloudflare_(deriveDateKey, startTime);
+      cloudflareDeriveOk = true;
 
     } catch (errPush) {
       cloudflarePushOk = false;
@@ -348,15 +356,11 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
         SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
         'ERROR',
         getElapsedSeconds_(startTime),
-        'Daily sync Cloudflare push failed after health OK. Error=' +
-          cloudflarePushError
+        'Daily sync Cloudflare push/derive failed after health OK. Error=' +
+        cloudflarePushError
       );
     }
 
-    /**
-     * Keep the Sheet operational.
-     * This should run after the Cloudflare push attempt.
-     */
     try {
       var ss = SpreadsheetApp.getActiveSpreadsheet();
       var dbSheet = getDbSheet_(ss);
@@ -381,11 +385,15 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
     cloudflarePushAllowed: healthOk,
     cloudflarePushOk: cloudflarePushOk,
     cloudflarePushError: cloudflarePushError,
+    cloudflareDeriveOk: cloudflareDeriveOk,
+    cloudflareDeriveError: cloudflareDeriveError,
+    cloudflareDeriveResult: cloudflareDeriveResult,
     cachePrune: cachePruneResult,
     cachePruneError: cachePruneError,
     total: totalTickers,
     success: state.successCount,
     duplicates: state.duplicateCount,
+    excluded: excludedCount,
     skip: state.skipCount,
     failed: state.failureCount,
     coverageRate: coverageRate,
@@ -402,7 +410,7 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
 
   writeSystemLog(
     module,
-    healthOk && cloudflarePushOk && !cachePruneError ? 'INFO' : 'ERROR',
+    healthOk && cloudflarePushOk && cloudflareDeriveOk && !cachePruneError ? 'INFO' : 'ERROR',
     getElapsedSeconds_(startTime),
     'Daily sync finished. Total=' +
       totalTickers +
@@ -410,6 +418,8 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
       state.successCount +
       ', Duplicates=' +
       state.duplicateCount +
+      ', Excluded=' +
+      excludedCount +
       ', Skip=' +
       state.skipCount +
       ', Failed=' +
@@ -424,6 +434,8 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
       ', CloudflarePushOk=' +
       cloudflarePushOk +
       ', CachePruneOk=' +
+      ', CloudflareDeriveOk=' +
+      cloudflareDeriveOk +
       (!!cachePruneResult)
   );
 }
@@ -476,4 +488,27 @@ function resetDailySyncState() {
 /* Backward-compatible wrapper. */
 function dailyIncrementalSync() {
   startDailySyncNow();
+}
+
+function isTickerEligibleForOhlcvDateCached_(registrySheet, ticker, dateKey, cache) {
+  var normalizedTicker = normalizeTicker_(ticker);
+  var normalizedDateKey = normalizeDateKey_(dateKey);
+
+  if (!normalizedTicker || !normalizedDateKey) return false;
+
+  cache = cache || {};
+
+  if (!cache[normalizedDateKey]) {
+    var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, normalizedDateKey);
+    var map = {};
+
+    eligible.forEach(function(item) {
+      item = normalizeTicker_(item);
+      if (item) map[item] = true;
+    });
+
+    cache[normalizedDateKey] = map;
+  }
+
+  return !!cache[normalizedDateKey][normalizedTicker];
 }

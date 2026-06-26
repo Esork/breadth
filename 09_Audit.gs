@@ -4,7 +4,7 @@
  *
  * Design:
  * - Formula audit is used for missing-row queue generation.
- * - Script health inspector is used for no-new-sheet DB validation.
+ * - Script health inspector is used for no-new-sheet cache validation.
  * - Do not create random incident-specific audit sheets.
  */
 
@@ -16,9 +16,12 @@ function createMissingAuditFormula_Jun3_Jun4_2026() {
  * Creates/refreshes AUDIT_MISSING_OHLCV.
  *
  * Important:
- * Missing audit must only use eligible tickers:
+ * Missing audit currently uses current eligible tickers:
  * IsCurrentSP500 = TRUE
  * IsActive = TRUE
+ *
+ * For rebalance-transition dates, prefer script health inspector / date-aware
+ * helpers instead of relying on this formula audit alone.
  */
 function createMissingAuditFormula(targetDateKeys) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -67,7 +70,7 @@ function createMissingAuditFormula(targetDateKeys) {
     'AUDIT_OHLCV',
     'INFO',
     '0s',
-    'Missing audit formula created for eligible tickers only. Dates=' +
+    'Missing audit formula created for current eligible tickers. Dates=' +
       targetDateKeys.join(', ')
   );
 }
@@ -95,149 +98,180 @@ function inspectLatestOhlcvDateHealth() {
 
 function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
   var startTime = Date.now();
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var module = 'AUDIT_OHLCV';
 
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
   var registrySheet = getRegistrySheet_(ss);
 
-  var eligibleTickers = readEligibleTickerListFromRegistry_(registrySheet);
-  var eligibleMap = {};
-
-  for (var e = 0; e < eligibleTickers.length; e++) {
-    eligibleMap[normalizeTicker_(eligibleTickers[e])] = true;
-  }
-
   var lastRow = dbSheet.getLastRow();
+
   if (lastRow < 2) {
-    throw new Error('DB_OHLCV has no data rows.');
+    var emptyResult = {
+      date: null,
+      status: 'EMPTY',
+      method: 'TAIL_SCAN_DATE_AWARE',
+      scannedRows: 0,
+      expectedEligibleCount: 0,
+      rawRows: 0,
+      uniqueTickerDates: 0,
+      duplicatePairCount: 0,
+      duplicateExtraRows: 0,
+      missingCount: 0,
+      extraTickerCount: 0,
+      duplicateSamples: [],
+      missingSamples: [],
+      extraTickerSamples: [],
+      elapsedSeconds: getElapsedSeconds_(startTime)
+    };
+
+    writeSystemLog(
+      module,
+      'WARN',
+      getElapsedSeconds_(startTime),
+      'OHLCV health check found empty cache.'
+    );
+
+    return emptyResult;
   }
 
-  var safeLookbackRows = Math.max(1000, Number(lookbackRows) || 5000);
-  var startRow = Math.max(2, lastRow - safeLookbackRows + 1);
-  var numRows = lastRow - startRow + 1;
+  var scanRows = Math.min(Number(lookbackRows) || 2000, lastRow - 1);
+  var scanStartRow = lastRow - scanRows + 1;
 
-  var values = dbSheet.getRange(startRow, 1, numRows, 2).getValues();
+  var values = dbSheet
+    .getRange(scanStartRow, 1, scanRows, 2)
+    .getValues();
 
-  var latestDateKey = '';
+  var latestDateKey = null;
 
   for (var i = 0; i < values.length; i++) {
     var dateKey = normalizeDateKey_(values[i][1]);
-    if (!dateKey) continue;
-    if (!latestDateKey || dateKey > latestDateKey) latestDateKey = dateKey;
+    if (dateKey && (!latestDateKey || dateKey > latestDateKey)) {
+      latestDateKey = dateKey;
+    }
   }
 
   if (!latestDateKey) {
-    throw new Error('No date found in DB_OHLCV tail. startRow=' + startRow + ', numRows=' + numRows);
+    throw new Error('Could not detect latest OHLCV date from cache tail.');
   }
 
-  var rawRows = 0;
-  var keyCounts = {};
-  var tickerSeen = {};
-  var extraTickerMap = {};
+  var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, latestDateKey);
+  var expectedMap = {};
 
-  for (var j = 0; j < values.length; j++) {
-    var ticker = normalizeTicker_(values[j][0]);
-    var rowDateKey = normalizeDateKey_(values[j][1]);
+  eligible.forEach(function(ticker) {
+    ticker = normalizeTicker_(ticker);
+    if (ticker) expectedMap[ticker] = true;
+  });
+
+  var expectedEligibleCount = eligible.length;
+
+  var pairCounts = {};
+  var presentTickers = {};
+  var rawRows = 0;
+
+  for (var r = 0; r < values.length; r++) {
+    var ticker = normalizeTicker_(values[r][0]);
+    var rowDateKey = normalizeDateKey_(values[r][1]);
 
     if (!ticker || rowDateKey !== latestDateKey) continue;
 
     rawRows++;
+    presentTickers[ticker] = true;
 
     var key = ticker + '|' + rowDateKey;
-    keyCounts[key] = (keyCounts[key] || 0) + 1;
-    tickerSeen[ticker] = true;
-
-    if (!eligibleMap[ticker]) {
-      extraTickerMap[ticker] = true;
-    }
+    pairCounts[key] = (pairCounts[key] || 0) + 1;
   }
 
+  var keys = Object.keys(pairCounts);
   var duplicatePairCount = 0;
   var duplicateExtraRows = 0;
   var duplicateSamples = [];
 
-  var keys = Object.keys(keyCounts);
-
-  for (var k = 0; k < keys.length; k++) {
-    var count = keyCounts[keys[k]];
+  keys.forEach(function(key) {
+    var count = pairCounts[key];
 
     if (count > 1) {
       duplicatePairCount++;
       duplicateExtraRows += count - 1;
 
-      if (duplicateSamples.length < 20) {
-        duplicateSamples.push(keys[k] + ' x' + count);
+      if (duplicateSamples.length < 10) {
+        duplicateSamples.push(key + ' x' + count);
       }
     }
-  }
+  });
 
-  var missingTickers = [];
-
-  for (var m = 0; m < eligibleTickers.length; m++) {
-    var eligibleTicker = normalizeTicker_(eligibleTickers[m]);
-
-    if (!tickerSeen[eligibleTicker]) {
-      missingTickers.push(eligibleTicker);
+  var missing = [];
+  eligible.forEach(function(ticker) {
+    ticker = normalizeTicker_(ticker);
+    if (ticker && !presentTickers[ticker]) {
+      missing.push(ticker);
     }
-  }
+  });
 
-  var extraTickers = Object.keys(extraTickerMap).sort();
+  var extras = [];
+  Object.keys(presentTickers).forEach(function(ticker) {
+    if (!expectedMap[ticker]) {
+      extras.push(ticker);
+    }
+  });
 
-  var expectedEligibleCount = eligibleTickers.length;
-  var uniqueTickerDates = keys.length;
+  missing.sort();
+  extras.sort();
 
-  var isClean =
+  var status =
     rawRows === expectedEligibleCount &&
-    uniqueTickerDates === expectedEligibleCount &&
+    keys.length === expectedEligibleCount &&
     duplicateExtraRows === 0 &&
-    missingTickers.length === 0 &&
-    extraTickers.length === 0;
+    missing.length === 0 &&
+    extras.length === 0
+      ? 'OK'
+      : 'FAIL';
 
   var result = {
     date: latestDateKey,
-    status: isClean ? 'OK' : 'FAIL',
-    method: 'TAIL_SCAN',
-    scannedRows: numRows,
-    scanStartRow: startRow,
+    status: status,
+    method: 'TAIL_SCAN_DATE_AWARE',
+    scannedRows: scanRows,
+    scanStartRow: scanStartRow,
     scanEndRow: lastRow,
     expectedEligibleCount: expectedEligibleCount,
     rawRows: rawRows,
-    uniqueTickerDates: uniqueTickerDates,
+    uniqueTickerDates: keys.length,
     duplicatePairCount: duplicatePairCount,
     duplicateExtraRows: duplicateExtraRows,
-    missingCount: missingTickers.length,
-    extraTickerCount: extraTickers.length,
+    missingCount: missing.length,
+    extraTickerCount: extras.length,
     duplicateSamples: duplicateSamples,
-    missingSamples: missingTickers.slice(0, 20),
-    extraTickerSamples: extraTickers.slice(0, 20),
+    missingSamples: missing.slice(0, 20),
+    extraTickerSamples: extras.slice(0, 20),
     elapsedSeconds: getElapsedSeconds_(startTime)
   };
 
-  Logger.log(JSON.stringify(result, null, 2));
-
   writeSystemLog(
-    'AUDIT_OHLCV',
-    isClean ? 'INFO' : 'WARN',
-    result.elapsedSeconds,
+    module,
+    status === 'OK' ? 'INFO' : 'WARN',
+    getElapsedSeconds_(startTime),
     'Latest OHLCV health ' +
-      result.status +
+      status +
       '. Date=' +
       latestDateKey +
-      ', Method=TAIL_SCAN' +
+      ', Method=TAIL_SCAN_DATE_AWARE' +
       ', ScannedRows=' +
-      numRows +
+      scanRows +
       ', Expected=' +
       expectedEligibleCount +
       ', RawRows=' +
       rawRows +
       ', Unique=' +
-      uniqueTickerDates +
+      keys.length +
       ', Duplicates=' +
       duplicateExtraRows +
       ', Missing=' +
-      missingTickers.length +
+      missing.length +
       ', Extra=' +
-      extraTickers.length
+      extras.length +
+      (extras.length ? ', ExtraSamples=' + extras.slice(0, 10).join(',') : '') +
+      (missing.length ? ', MissingSamples=' + missing.slice(0, 10).join(',') : '')
   );
 
   return result;

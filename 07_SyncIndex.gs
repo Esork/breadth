@@ -269,3 +269,128 @@ function refreshSyncIndexFromDB() {
     'SYS_SYNC_INDEX rebuilt from DB_OHLCV. Registry tickers=' + Object.keys(registryMap).length
   );
 }
+
+var SP500_MEMBERSHIP_EVENTS = [
+  {
+    effectiveDate: '2026-06-22',
+    add: ['MRVL', 'FLEX'],
+    remove: ['POOL', 'CPB'],
+    source: 'S&P Global 2026-06-05 rebalance'
+  }
+];
+
+function getSp500MembershipEvents_() {
+  return SP500_MEMBERSHIP_EVENTS || [];
+}
+
+/**
+ * Returns the correct S&P 500 universe for a specific OHLCV date.
+ *
+ * Logic:
+ * - Start from current SYS_SYNC_INDEX eligible universe.
+ * - If an event effective date is AFTER target date, rewind that event:
+ *   - remove future additions
+ *   - restore future removals
+ */
+function readEligibleTickerListForOhlcvDate_(registrySheet, dateKey) {
+  var targetDateKey = normalizeDateKey_(dateKey);
+  if (!targetDateKey) {
+    return readEligibleTickerListFromRegistry_(registrySheet);
+  }
+
+  var current = readEligibleTickerListFromRegistry_(registrySheet);
+  var map = {};
+
+  current.forEach(function(ticker) {
+    ticker = normalizeTicker_(ticker);
+    if (ticker) map[ticker] = true;
+  });
+
+  var events = getSp500MembershipEvents_();
+
+  for (var i = 0; i < events.length; i++) {
+    var event = events[i];
+    var effectiveDateKey = normalizeDateKey_(event.effectiveDate);
+
+    if (!effectiveDateKey) continue;
+
+    /**
+     * If target OHLCV date is before the event effective date,
+     * undo the event.
+     */
+    if (targetDateKey < effectiveDateKey) {
+      (event.add || []).forEach(function(ticker) {
+        ticker = normalizeTicker_(ticker);
+        if (ticker) delete map[ticker];
+      });
+
+      (event.remove || []).forEach(function(ticker) {
+        ticker = normalizeTicker_(ticker);
+        if (ticker) map[ticker] = true;
+      });
+    }
+  }
+
+  return Object.keys(map).sort();
+}
+
+/**
+ * Daily sync candidate list.
+ *
+ * This intentionally includes both current tickers and known transition tickers.
+ * Later, after GOOGLEFINANCE tells us the actual OHLCV date, we filter each ticker
+ * through readEligibleTickerListForOhlcvDate_().
+ */
+function readDailySyncCandidateTickerList_(registrySheet) {
+  var map = {};
+
+  readEligibleTickerListFromRegistry_(registrySheet).forEach(function(ticker) {
+    ticker = normalizeTicker_(ticker);
+    if (ticker) map[ticker] = true;
+  });
+
+  getSp500MembershipEvents_().forEach(function(event) {
+    (event.add || []).forEach(function(ticker) {
+      ticker = normalizeTicker_(ticker);
+      if (ticker) map[ticker] = true;
+    });
+
+    (event.remove || []).forEach(function(ticker) {
+      ticker = normalizeTicker_(ticker);
+      if (ticker) map[ticker] = true;
+    });
+  });
+
+  return Object.keys(map).sort();
+}
+
+function inspectDateAwareUniverseTest() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var registrySheet = getRegistrySheet_(ss);
+
+  var dates = ['2026-06-18', '2026-06-22'];
+  var output = {
+    currentEligibleCount: readEligibleTickerListFromRegistry_(registrySheet).length,
+    dailySyncCandidateCount: readDailySyncCandidateTickerList_(registrySheet).length,
+    byDate: {}
+  };
+
+  dates.forEach(function(dateKey) {
+    var list = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
+    var map = {};
+
+    list.forEach(function(ticker) {
+      map[ticker] = true;
+    });
+
+    output.byDate[dateKey] = {
+      count: list.length,
+      hasCPB: !!map.CPB,
+      hasPOOL: !!map.POOL,
+      hasMRVL: !!map.MRVL,
+      hasFLEX: !!map.FLEX
+    };
+  });
+
+  Logger.log(JSON.stringify(output, null, 2));
+}

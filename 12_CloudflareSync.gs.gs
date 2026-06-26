@@ -10,6 +10,26 @@
 
 var CF_LAST_OHLCV_PUSH_PROP_KEY = 'QE_CF_LAST_OHLCV_PUSH_V1';
 
+function getCloudflareIngestToken_() {
+  var token = PropertiesService
+    .getScriptProperties()
+    .getProperty('CF_INGEST_TOKEN');
+
+  token = String(token || '').trim();
+
+  if (!token) {
+    throw new Error(
+      'Missing Script Property CF_INGEST_TOKEN. Add it in Apps Script Project Settings.'
+    );
+  }
+
+  if (token === 'CHANGE_ME_LATER') {
+    throw new Error('CF_INGEST_TOKEN is still CHANGE_ME_LATER.');
+  }
+
+  return token;
+}
+
 function pushTickerRegistryToCloudflare() {
   var startTime = Date.now();
   var module = SYS_CONFIG.CLOUDFLARE.LOG_MODULE;
@@ -316,7 +336,7 @@ function postCloudflareInBatches_(path, rows, options) {
           data: batch
         }),
         headers: {
-          Authorization: 'Bearer ' + ingestToken
+          Authorization: 'Bearer ' + getCloudflareIngestToken_()
         }
       }
     );
@@ -385,31 +405,6 @@ function assertCloudflareConfig_() {
   }
 
   getCloudflareIngestToken_();
-}
-
-function getCloudflareIngestToken_() {
-  var token = PropertiesService
-    .getScriptProperties()
-    .getProperty('CF_INGEST_TOKEN');
-
-  token = String(token || '').trim();
-
-  if (!token) {
-    throw new Error(
-      'Missing Script Property CF_INGEST_TOKEN. Add it in Apps Script Project Settings.'
-    );
-  }
-
-  if (token === 'CHANGE_ME_LATER') {
-    throw new Error('CF_INGEST_TOKEN is still CHANGE_ME_LATER.');
-  }
-
-  return token;
-}
-
-function testConnection() {
-  var response = UrlFetchApp.fetch("https://breadth-db-api.kamarski.workers.dev/");
-  Logger.log(response.getContentText());
 }
 
 function pushAllCleanOhlcvCacheDatesToCloudflare() {
@@ -545,4 +540,96 @@ function pushAllCleanOhlcvCacheDatesToCloudflare() {
       ', ExpectedRowsPerDate=' +
       expectedEligibleCount
   );
+}
+
+function deriveLatestCleanOhlcvDateOnCloudflare() {
+  var startTime = Date.now();
+  var module = SYS_CONFIG.CLOUDFLARE.LOG_MODULE;
+
+  var health = inspectLatestOhlcvDateHealth();
+
+  if (!health || health.status !== 'OK') {
+    throw new Error(
+      'Latest OHLCV health is not OK. Refusing Cloudflare derive. Health=' +
+        JSON.stringify(health)
+    );
+  }
+
+  var dateKey = normalizeDateKey_(health.date);
+
+  if (!dateKey) {
+    throw new Error(
+      'Could not resolve latest clean OHLCV date from health result. Health=' +
+        JSON.stringify(health)
+    );
+  }
+
+  return deriveOhlcvDateOnCloudflare_(dateKey, startTime);
+}
+
+function deriveOhlcvDateOnCloudflare_(dateKey, startTime) {
+  var module = SYS_CONFIG.CLOUDFLARE.LOG_MODULE;
+  var normalizedDateKey = normalizeDateKey_(dateKey);
+
+  if (!normalizedDateKey) {
+    throw new Error('Invalid derive date: ' + dateKey);
+  }
+
+  var path = '/jobs/derive/date?date=' + encodeURIComponent(normalizedDateKey);
+
+  var response = UrlFetchApp.fetch(
+    SYS_CONFIG.CLOUDFLARE.BASE_URL + path,
+    {
+      method: 'post',
+      muteHttpExceptions: true,
+      headers: {
+        Authorization: 'Bearer ' + getCloudflareIngestToken_()
+      }
+    }
+  );
+
+  var code = response.getResponseCode();
+  var text = response.getContentText();
+  var parsed = parseJsonSafe_(text, {});
+
+  if (code < 200 || code >= 300 || !parsed.ok) {
+    writeSystemLog(
+      module,
+      'ERROR',
+      getElapsedSeconds_(startTime || Date.now()),
+      'Cloudflare derive failed. Date=' +
+        normalizedDateKey +
+        ', HTTP=' +
+        code +
+        ', Body=' +
+        text
+    );
+
+    throw new Error(
+      'Cloudflare derive failed. Date=' +
+        normalizedDateKey +
+        ', HTTP=' +
+        code +
+        ', Body=' +
+        text
+    );
+  }
+
+  writeSystemLog(
+    module,
+    'INFO',
+    getElapsedSeconds_(startTime || Date.now()),
+    'Cloudflare derive completed. Date=' +
+      normalizedDateKey +
+      ', RowsWritten=' +
+      Number(parsed.rows_written || 0) +
+      ', TickerIndicators=' +
+      Number(parsed.derived && parsed.derived.ticker_indicators || 0) +
+      ', MarketBreadth=' +
+      Number(parsed.derived && parsed.derived.market_breadth || 0) +
+      ', SectorBreadth=' +
+      Number(parsed.derived && parsed.derived.sector_breadth || 0)
+  );
+
+  return parsed;
 }
