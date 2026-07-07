@@ -17,10 +17,6 @@ function getRegistrySheet_(ss) {
   return sheet;
 }
 
-function getSyncIndexSheet_(ss) {
-  return getRegistrySheet_(ss);
-}
-
 function ensureRegistryHeader_(sheet) {
   var header = [
     'Ticker',
