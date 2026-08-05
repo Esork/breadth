@@ -324,6 +324,7 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
   var cloudflareDeriveError = null;
   var cloudflareDeriveResult = null;
 
+  var cachePruneOk = false;
   var cachePruneResult = null;
   var cachePruneError = null;
 
@@ -344,10 +345,6 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
       pushLatestCleanOhlcvDateToCloudflare();
       cloudflarePushOk = true;
 
-      var deriveDateKey = normalizeDateKey_(healthResult.date);
-      cloudflareDeriveResult = deriveOhlcvDateOnCloudflare_(deriveDateKey, startTime);
-      cloudflareDeriveOk = true;
-
     } catch (errPush) {
       cloudflarePushOk = false;
       cloudflarePushError = String(errPush);
@@ -356,9 +353,29 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
         SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
         'ERROR',
         getElapsedSeconds_(startTime),
-        'Daily sync Cloudflare push/derive failed after health OK. Error=' +
+        'Daily sync Cloudflare push failed after health OK. Error=' +
         cloudflarePushError
       );
+    }
+
+    if (cloudflarePushOk) {
+      try {
+        var deriveDateKey = normalizeDateKey_(healthResult.date);
+        cloudflareDeriveResult = deriveOhlcvDateOnCloudflare_(deriveDateKey, startTime);
+        cloudflareDeriveOk = true;
+
+      } catch (errDerive) {
+        cloudflareDeriveOk = false;
+        cloudflareDeriveError = String(errDerive);
+
+        writeSystemLog(
+          SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
+          'ERROR',
+          getElapsedSeconds_(startTime),
+          'Daily sync Cloudflare derive failed after push OK. Error=' +
+          cloudflareDeriveError
+        );
+      }
     }
 
     try {
@@ -366,8 +383,10 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
       var dbSheet = getDbSheet_(ss);
 
       cachePruneResult = pruneOhlcvCacheToLatestDays_(dbSheet, 3);
+      cachePruneOk = true;
 
     } catch (errPrune) {
+      cachePruneOk = false;
       cachePruneError = String(errPrune);
 
       writeSystemLog(
@@ -388,6 +407,7 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
     cloudflareDeriveOk: cloudflareDeriveOk,
     cloudflareDeriveError: cloudflareDeriveError,
     cloudflareDeriveResult: cloudflareDeriveResult,
+    cachePruneOk: cachePruneOk,
     cachePrune: cachePruneResult,
     cachePruneError: cachePruneError,
     total: totalTickers,
@@ -410,7 +430,7 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
 
   writeSystemLog(
     module,
-    healthOk && cloudflarePushOk && cloudflareDeriveOk && !cachePruneError ? 'INFO' : 'ERROR',
+    healthOk && cloudflarePushOk && cloudflareDeriveOk && cachePruneOk ? 'INFO' : 'ERROR',
     getElapsedSeconds_(startTime),
     'Daily sync finished. Total=' +
       totalTickers +
@@ -433,10 +453,10 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
       healthOk +
       ', CloudflarePushOk=' +
       cloudflarePushOk +
-      ', CachePruneOk=' +
       ', CloudflareDeriveOk=' +
       cloudflareDeriveOk +
-      (!!cachePruneResult)
+      ', CachePruneOk=' +
+      cachePruneOk
   );
 }
 
