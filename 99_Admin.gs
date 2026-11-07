@@ -379,7 +379,8 @@ function runNov2026OhlcvRecoveryWorker() {
     }
 
     if (state.phase === 'FINALIZE') {
-      finalizeNov2026OhlcvRecovery_(state);
+      var recoveryDone = finalizeNov2026OhlcvRecovery_(state);
+      if (!recoveryDone) return;
       var summary = {
         status: 'DONE',
         dates: state.dates,
@@ -423,10 +424,14 @@ function resumeNov2026OhlcvRecovery() {
   state.lastError = null;
   state.failedAt = null;
   state.attempts = state.attempts || {};
+  if (state.phase === 'FETCH' && state.cursor < state.tickers.length) {
+    delete state.attempts[state.tickers[state.cursor]];
+  }
   props.setProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
   installEveryMinutesTrigger_('runNov2026OhlcvRecoveryWorker', 1);
-  Logger.log('Recovery resumed at phase=' + state.phase + ', cursor=' + state.cursor +
-    '/' + state.tickers.length);
+  Logger.log('Recovery resumed at phase=' + state.phase + ', cursor=' +
+    (state.phase === 'FETCH' ? state.cursor + '/' + state.tickers.length :
+      Number(state.dateCursor || 0) + '/' + state.dates.length));
 }
 
 /** Read-only post-run verification. Requires recovery to have completed. */
@@ -436,22 +441,33 @@ function verifyNov2026OhlcvRecovery() {
   if (active) throw new Error('Recovery is still active or paused. Inspect state before verification.');
 
   var results = [];
+  var allOk = true;
   for (var i = 0; i < NOV2026_OHLCV_RECOVERY_DATES_.length; i++) {
     var dateKey = NOV2026_OHLCV_RECOVERY_DATES_[i];
     var quality = fetchNov2026CloudflareQuality_(dateKey);
     var dashboard = fetchNov2026CloudflareJson_('/api/dashboard?date=' + encodeURIComponent(dateKey));
+    var marketRows = dashboard.data && dashboard.data.market ? 1 : 0;
+    var sectorRows = dashboard.data && dashboard.data.sectors ? dashboard.data.sectors.length : 0;
+    var runs = dashboard.data && dashboard.data.calculation_runs ? dashboard.data.calculation_runs : [];
+    var deriveDone = runs.some(function(run) {
+      return run.job_type === 'DERIVE_DAILY_BREADTH' && run.status === 'DONE';
+    });
+    var ok = quality.status === 'OK' &&
+      quality.missing_count === 0 &&
+      quality.extra_count === 0 &&
+      quality.duplicate_extra_rows === 0 &&
+      marketRows === 1 && sectorRows > 0 && deriveDone;
+    if (!ok) allOk = false;
     results.push({
       date: dateKey,
+      ok: ok,
       quality: quality,
-      dashboard: dashboard.data ? {
-        marketRows: dashboard.data.market ? 1 : 0,
-        sectorRows: (dashboard.data.sectors || []).length,
-        calculationRuns: (dashboard.data.calculation_runs || []).length
-      } : null
+      derived: { marketRows: marketRows, sectorRows: sectorRows, deriveDone: deriveDone }
     });
   }
 
   var output = {
+    ok: allOk,
     lastRun: parseJsonSafe_(props.getProperty(NOV2026_OHLCV_RECOVERY_LAST_KEY_), null),
     results: results
   };
@@ -467,12 +483,12 @@ function assertNov2026RecoveryCanStart_() {
       JSON.stringify(snapshot.blockingStates));
   }
 
-  var triggers = ScriptApp.getProjectTriggers();
-  var dailyWorkerActive = triggers.some(function(t) {
-    return t.getHandlerFunction() === 'dailySyncWorker';
+  var conflictingWorkers = snapshot.workerTriggers.filter(function(item) {
+    return item.handler !== 'runNov2026OhlcvRecoveryWorker';
   });
-  if (dailyWorkerActive) {
-    throw new Error('Refusing recovery while dailySyncWorker trigger exists. Inspect daily sync first.');
+  if (conflictingWorkers.length > 0) {
+    throw new Error('Refusing recovery while other worker triggers exist: ' +
+      JSON.stringify(conflictingWorkers));
   }
 
   if (props.getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_)) {
@@ -491,13 +507,12 @@ function buildNov2026OhlcvRecoveryPlan_() {
   var cacheMap = {};
   var duplicateKeys = [];
   var cacheDateCounts = {};
-  var cacheExtraTickers = {};
   var eligibleByDate = {};
   var tickerUnion = {};
 
   NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
     eligibleByDate[dateKey] = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
-    tickerUnion && eligibleByDate[dateKey].forEach(function(ticker) {
+    eligibleByDate[dateKey].forEach(function(ticker) {
       tickerUnion[normalizeTicker_(ticker)] = true;
     });
   });
@@ -525,8 +540,9 @@ function buildNov2026OhlcvRecoveryPlan_() {
     var eligibleMap = {};
 
     eligible.forEach(function(ticker) {
-      eligibleMap[normalizeTicker_(ticker)] = true;
-      var record = cacheMap[normalizeTicker_(ticker) + '|' + dateKey];
+      var normalized = normalizeTicker_(ticker);
+      eligibleMap[normalized] = true;
+      var record = cacheMap[normalized + '|' + dateKey];
       if (!record) missing.push(ticker);
       else if (!isValidNov2026OhlcvRow_(record.row)) invalid.push(ticker);
       else validCount++;
@@ -560,7 +576,7 @@ function buildNov2026OhlcvRecoveryPlan_() {
     duplicateKeySamples: duplicateKeys.slice(0, 30),
     tickerUnion: Object.keys(tickerUnion).sort(),
     dates: dateReports,
-    note: '11/6 is intentionally excluded. Cache rows outside the four target dates are not modified.'
+    note: 'Every eligible ticker/date in scope will be re-fetched from GoogleFinance, including existing 11/4 and 11/5 rows. 11/6 and all other cache rows are untouched.'
   };
 }
 
@@ -607,37 +623,33 @@ function runNov2026OhlcvRecoveryFetchBatch_(state, startedAt) {
          processed < NOV2026_OHLCV_RECOVERY_BATCH_SIZE_ &&
          Date.now() - startedAt < 210000) {
     var ticker = normalizeTicker_(state.tickers[state.cursor]);
-    var needsFetch = false;
-
-    state.dates.forEach(function(dateKey) {
-      if (!eligibleMaps[dateKey][ticker]) return;
-      var record = cache[ticker + '|' + dateKey];
-      if (!record || !isValidNov2026OhlcvRow_(record.row)) needsFetch = true;
+    var eligibleDates = state.dates.filter(function(dateKey) {
+      return eligibleMaps[dateKey][ticker];
     });
 
-    if (needsFetch) {
-      try {
+    try {
+      if (eligibleDates.length > 0) {
+        // Re-fetch every in-scope bar, including existing 11/4 and 11/5 rows.
+        // This validates the existing values against GoogleFinance, not just row counts.
         var bars = fetchGoogleFinanceBarsForRange_(tempSheet, ticker,
           state.dates[0], state.dates[state.dates.length - 1]);
         var barsByDate = {};
         bars.forEach(function(bar) { barsByDate[bar.dateKey] = bar; });
 
-        var appendRows = [];
         var replacements = [];
-        state.dates.forEach(function(dateKey) {
-          if (!eligibleMaps[dateKey][ticker]) return;
-          var key = ticker + '|' + dateKey;
-          var existing = cache[key];
-          if (existing && isValidNov2026OhlcvRow_(existing.row)) return;
-
+        var appendRows = [];
+        eligibleDates.forEach(function(dateKey) {
           var bar = barsByDate[dateKey];
-          if (!bar) throw new Error('GoogleFinance returned no bar for ' + ticker + ' on ' + dateKey);
-
+          if (!bar) {
+            throw new Error('GoogleFinance returned no bar for ' + ticker + ' on ' + dateKey);
+          }
           var row = [ticker, bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume];
           if (!isValidNov2026OhlcvRow_(row)) {
             throw new Error('Invalid GoogleFinance OHLCV values for ' + ticker + ' on ' + dateKey);
           }
 
+          var key = ticker + '|' + dateKey;
+          var existing = cache[key];
           if (existing) replacements.push({ rowNumber: existing.rowNumber, row: row, key: key });
           else appendRows.push({ row: row, key: key });
         });
@@ -655,25 +667,25 @@ function runNov2026OhlcvRecoveryFetchBatch_(state, startedAt) {
             cache[item.key] = { row: item.row, rowNumber: firstRow + index };
           });
         }
-      } catch (err) {
-        state.attempts[ticker] = Number(state.attempts[ticker] || 0) + 1;
-        state.lastError = ticker + ': ' + String(err);
-        PropertiesService.getScriptProperties().setProperty(
-          NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
-        if (state.attempts[ticker] >= NOV2026_OHLCV_RECOVERY_MAX_ATTEMPTS_) {
-          throw new Error('Retry limit reached for ' + ticker + '. ' + state.lastError);
-        }
-        Logger.log('Transient fetch failure; will retry ticker=' + ticker +
-          ', attempt=' + state.attempts[ticker]);
-        return;
       }
-    }
 
-    delete state.attempts[ticker];
-    state.cursor++;
-    processed++;
-    PropertiesService.getScriptProperties().setProperty(
-      NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
+      delete state.attempts[ticker];
+      state.cursor++;
+      processed++;
+      PropertiesService.getScriptProperties().setProperty(
+        NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
+    } catch (err) {
+      state.attempts[ticker] = Number(state.attempts[ticker] || 0) + 1;
+      state.lastError = ticker + ': ' + String(err);
+      PropertiesService.getScriptProperties().setProperty(
+        NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
+      if (state.attempts[ticker] >= NOV2026_OHLCV_RECOVERY_MAX_ATTEMPTS_) {
+        throw new Error('Retry limit reached for ' + ticker + '. ' + state.lastError);
+      }
+      Logger.log('Transient fetch failure; next trigger will retry ticker=' + ticker +
+        ', attempt=' + state.attempts[ticker]);
+      return;
+    }
   }
 
   Logger.log('Recovery fetch progress: ' + state.cursor + '/' + state.tickers.length);
@@ -708,74 +720,66 @@ function isValidNov2026OhlcvRow_(row) {
 }
 
 function finalizeNov2026OhlcvRecovery_(state) {
+  var dateIndex = Number(state.dateCursor || 0);
+  if (dateIndex >= state.dates.length) return true;
+
+  var dateKey = state.dates[dateIndex];
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
   var registrySheet = getRegistrySheet_(ss);
   var cache = readNov2026CacheMap_(dbSheet);
+  var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
+  var rows = [];
+  var missing = [];
 
-  // Validate every date completely before the first Cloudflare write.
-  var payloads = [];
-  state.dates.forEach(function(dateKey) {
-    var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
-    var eligibleMap = {};
-    eligible.forEach(function(t) { eligibleMap[normalizeTicker_(t)] = true; });
-    var rows = [];
-    var missing = [];
-
-    eligible.forEach(function(ticker) {
-      var record = cache[normalizeTicker_(ticker) + '|' + dateKey];
-      if (!record || !isValidNov2026OhlcvRow_(record.row)) missing.push(ticker);
-      else rows.push(normalizeOhlcvRowForCloudflare_(record.row, dateKey));
-    });
-
-    if (missing.length > 0 || rows.length !== eligible.length) {
-      throw new Error('Local cache is not complete for ' + dateKey +
-        '. Expected=' + eligible.length + ', valid=' + rows.length +
-        ', missing/invalid=' + missing.length + ', samples=' + missing.slice(0, 30).join(', '));
-    }
-
-    Object.keys(cache).forEach(function(key) {
-      var parts = key.split('|');
-      if (parts[1] === dateKey && !eligibleMap[parts[0]]) {
-        throw new Error('Unexpected extra ticker in cache for ' + dateKey + ': ' + parts[0]);
-      }
-    });
-
-    payloads.push({ date: dateKey, rows: rows });
+  eligible.forEach(function(ticker) {
+    var record = cache[normalizeTicker_(ticker) + '|' + dateKey];
+    if (!record || !isValidNov2026OhlcvRow_(record.row)) missing.push(ticker);
+    else rows.push(normalizeOhlcvRowForCloudflare_(record.row, dateKey));
   });
 
-  payloads.forEach(function(payload) {
-    var post = postCloudflareInBatches_('/ingest/ohlcv', payload.rows);
-    if (post.failedBatches !== 0 || post.acceptedRows !== payload.rows.length) {
-      throw new Error('Cloudflare ingest count mismatch for ' + payload.date +
-        ': ' + JSON.stringify(post));
-    }
+  if (missing.length > 0 || rows.length !== eligible.length) {
+    throw new Error('Local cache is not complete for ' + dateKey +
+      '. Expected=' + eligible.length + ', valid=' + rows.length +
+      ', missing/invalid=' + missing.length + ', samples=' + missing.slice(0, 30).join(', '));
+  }
 
-    var quality = fetchNov2026CloudflareQuality_(payload.date);
-    if (quality.status !== 'OK' ||
-        quality.raw_rows !== payload.rows.length ||
-        quality.unique_tickers !== payload.rows.length ||
-        quality.missing_count !== 0 ||
-        quality.extra_count !== 0 ||
-        quality.duplicate_extra_rows !== 0) {
-      throw new Error('Cloudflare raw quality failed after ingest for ' +
-        payload.date + ': ' + JSON.stringify(quality));
-    }
+  var post = postCloudflareInBatches_('/ingest/ohlcv', rows);
+  if (post.failedBatches !== 0 || post.acceptedRows !== rows.length) {
+    throw new Error('Cloudflare ingest count mismatch for ' + dateKey +
+      ': ' + JSON.stringify(post));
+  }
 
-    var derive = deriveOhlcvDateOnCloudflare_(payload.date, Date.now());
-    if (!derive || !derive.ok || !derive.derived ||
-        Number(derive.derived.market_breadth || 0) < 1 ||
-        Number(derive.derived.sector_breadth || 0) < 1) {
-      throw new Error('Cloudflare derive verification failed for ' +
-        payload.date + ': ' + JSON.stringify(derive));
-    }
+  var quality = fetchNov2026CloudflareQuality_(dateKey);
+  if (quality.status !== 'OK' ||
+      quality.raw_rows !== rows.length ||
+      quality.unique_tickers !== rows.length ||
+      quality.missing_count !== 0 ||
+      quality.extra_count !== 0 ||
+      quality.duplicate_extra_rows !== 0) {
+    throw new Error('Cloudflare raw quality failed after ingest for ' +
+      dateKey + ': ' + JSON.stringify(quality));
+  }
 
-    Logger.log('Date recovered and derived: ' + payload.date +
-      ', rawRows=' + quality.raw_rows +
-      ', market=' + derive.derived.market_breadth +
-      ', sectors=' + derive.derived.sector_breadth);
-  });
+  var derive = deriveOhlcvDateOnCloudflare_(dateKey, Date.now());
+  if (!derive || !derive.ok || !derive.derived ||
+      Number(derive.derived.market_breadth || 0) < 1 ||
+      Number(derive.derived.sector_breadth || 0) < 1) {
+    throw new Error('Cloudflare derive verification failed for ' +
+      dateKey + ': ' + JSON.stringify(derive));
+  }
+
+  state.dateCursor = dateIndex + 1;
+  PropertiesService.getScriptProperties().setProperty(
+    NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
+  Logger.log('Date recovered and derived: ' + dateKey +
+    ', rawRows=' + quality.raw_rows +
+    ', market=' + derive.derived.market_breadth +
+    ', sectors=' + derive.derived.sector_breadth);
+  return state.dateCursor >= state.dates.length;
 }
+
+
 
 function fetchNov2026CloudflareQuality_(dateKey) {
   var result = fetchNov2026CloudflareJson_('/api/quality/check?date=' + encodeURIComponent(dateKey));
