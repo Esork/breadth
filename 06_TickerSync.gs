@@ -15,6 +15,16 @@ function syncSP500TickersList() {
 function syncSP500TickerRegistry() {
   var startTime = Date.now();
   var module = SYS_CONFIG.TICKER_SYNC.LOG_MODULE;
+
+  // Keep the historical recovery universe stable until its date batches are complete.
+  var recoveryState = PropertiesService.getScriptProperties()
+    .getProperty(LEGACY_WORKER_STATE_KEYS.OHLCV_INCIDENT_RECOVERY);
+  if (recoveryState) {
+    logWarn_(module, startTime,
+      'Ticker registry sync deferred while temporary November 2026 OHLCV recovery is active.');
+    return;
+  }
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var registrySheet = getRegistrySheet_(ss);
 
