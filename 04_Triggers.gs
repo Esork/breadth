@@ -218,7 +218,17 @@ function getBlockingWorkerStatesForProduction_() {
   Object.keys(LEGACY_WORKER_STATE_KEYS).forEach(function(name) {
     var key = LEGACY_WORKER_STATE_KEYS[name];
     var stateText = props.getProperty(key);
-    if (stateText) states.push({ key: key, state: parseJsonSafe_(stateText, stateText) });
+    if (!stateText) return;
+
+    var state = parseJsonSafe_(stateText, stateText);
+    // Completed legacy jobs may leave their state record behind. A terminal
+    // DONE record is historical metadata, not an active worker or blocker.
+    if (state && typeof state === 'object' &&
+        String(state.status || '').toUpperCase() === 'DONE') {
+      return;
+    }
+
+    states.push({ key: key, state: state });
   });
 
   return states;
