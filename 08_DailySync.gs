@@ -15,6 +15,16 @@ var DAILY_LAST_HEALTH_PROP_KEY = 'QE_DAILY_LAST_HEALTH_V1';
 function startDailySyncNow() {
   var startTime = Date.now();
   var module = SYS_CONFIG.DAILY_SYNC.LOG_MODULE;
+
+  // Prevent the production finish gate from pruning historical recovery rows.
+  var recoveryState = PropertiesService.getScriptProperties()
+    .getProperty(LEGACY_WORKER_STATE_KEYS.OHLCV_INCIDENT_RECOVERY);
+  if (recoveryState) {
+    logWarn_(module, startTime,
+      'Daily sync deferred while temporary November 2026 OHLCV recovery is active.');
+    return;
+  }
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
   var registrySheet = getRegistrySheet_(ss);
