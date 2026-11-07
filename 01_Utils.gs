@@ -36,12 +36,6 @@ function normalizeDateKey_(dateValue) {
   return text;
 }
 
-function dateKeyToDate_(dateKey) {
-  var parts = String(dateKey).split('-');
-  if (parts.length !== 3) throw new Error('Invalid dateKey: ' + dateKey);
-  return new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
-}
-
 function addDays_(date, days) {
   var d = new Date(date);
   d.setDate(d.getDate() + days);
@@ -65,15 +59,6 @@ function parseJsonSafe_(text, fallbackValue) {
   } catch (e) {
     return fallbackValue;
   }
-}
-
-function uniqueSorted_(values) {
-  var map = {};
-  values.forEach(function(v) {
-    var key = String(v || '').trim();
-    if (key) map[key] = true;
-  });
-  return Object.keys(map).sort();
 }
 
 function minDateKey_(dateKeys) {

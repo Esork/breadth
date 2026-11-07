@@ -440,25 +440,9 @@ function savePendingMembershipEvents_(events) {
  * ever suspect membership events are stuck (e.g. after the circuit breaker
  * fires, or after repeated push failures).
  */
-function inspectPendingMembershipEvents() {
-  var events = loadPendingMembershipEvents_();
-  Logger.log(JSON.stringify(events, null, 2));
-
-  writeSystemLog(
-    SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
-    'INFO',
-    '0s',
-    'Pending membership events inspected. Count=' + events.length + '. Check Apps Script Logger.'
-  );
-}
-
 /**
  * Manual escape hatch. Only call this after you've reviewed
  * inspectPendingMembershipEvents() output and either handled the events
  * manually (e.g. via direct SQL, like we did for CAG/HONA) or confirmed
  * they're stale/no-longer-relevant.
  */
-function clearPendingMembershipEvents() {
-  savePendingMembershipEvents_([]);
-  Logger.log('Pending membership events cleared.');
-}

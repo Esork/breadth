@@ -5,152 +5,272 @@
 
 function bootstrapBackendSheets() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  getTickerSheet_(ss);
+  getRegistrySheet_(ss);
   getDbSheet_(ss);
   getBufferSheet_(ss);
-  getSyncIndexSheet_(ss);
   getOrCreateSheet_(ss, SYS_CONFIG.SHEETS.LOGS, LOG_HEADER);
-  getOrCreateSheet_(ss, SYS_CONFIG.SHEETS.BACKFILL_QUEUE, BACKFILL_QUEUE_HEADER);
   writeSystemLog('ADMIN', 'INFO', '0s', 'Backend sheets bootstrapped.');
 }
 
 function inspectAllActiveStates() {
   var props = PropertiesService.getScriptProperties();
-  Logger.log(SYS_CONFIG.DAILY_SYNC.STATE_KEY + ' = ' + props.getProperty(SYS_CONFIG.DAILY_SYNC.STATE_KEY));
-  Logger.log(SYS_CONFIG.BACKFILL.STATE_KEY + ' = ' + props.getProperty(SYS_CONFIG.BACKFILL.STATE_KEY));
-
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    Logger.log('Trigger: ' + triggers[i].getHandlerFunction() + ' / ' + triggers[i].getEventType());
-  }
-
-  writeSystemLog('ADMIN', 'INFO', '0s', 'State inspected. Check Apps Script Logger.');
+  [
+    SYS_CONFIG.DAILY_SYNC.STATE_KEY,
+    LEGACY_WORKER_STATE_KEYS.MISSING_BACKFILL,
+    LEGACY_WORKER_STATE_KEYS.RANGE_BACKFILL,
+    DAILY_LAST_HEALTH_PROP_KEY,
+    CF_LAST_OHLCV_PUSH_PROP_KEY,
+    PENDING_MEMBERSHIP_EVENTS_PROP_KEY
+  ].forEach(function(key) { Logger.log(key + ' = ' + props.getProperty(key)); });
+  var snapshot = buildTriggerSetupSnapshot_();
+  Logger.log(JSON.stringify(snapshot, null, 2));
+  writeSystemLog('ADMIN', 'INFO', '0s', 'States and triggers inspected. Check Apps Script Logger.');
 }
 
-function hardResetWorkersOnly() {
-  PropertiesService.getScriptProperties().deleteProperty(SYS_CONFIG.DAILY_SYNC.STATE_KEY);
-  PropertiesService.getScriptProperties().deleteProperty(SYS_CONFIG.BACKFILL.STATE_KEY);
-  clearAllKnownWorkerTriggers();
-  writeSystemLog('ADMIN', 'WARN', '0s', 'Hard reset worker states only. Production start/ticker triggers were not removed.');
+function inspectOhlcvCacheDateAgainstCurrentRegistry(targetDate) {
+  var dateKey = normalizeDateKey_(targetDate);
+  if (!dateKey) throw new Error('Pass targetDate as YYYY-MM-DD.');
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var dbSheet = getDbSheet_(ss);
+  var registrySheet = getRegistrySheet_(ss);
+  var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
+  var eligibleMap = {};
+  eligible.forEach(function(t) { eligibleMap[normalizeTicker_(t)] = true; });
+  var lastRow = dbSheet.getLastRow();
+  var values = lastRow < 2 ? [] : dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).getValues();
+  var presentMap = {}, extras = [];
+  values.forEach(function(row) {
+    var ticker = normalizeTicker_(row[0]);
+    if (normalizeDateKey_(row[1]) !== dateKey || !ticker) return;
+    presentMap[ticker] = true;
+    if (!eligibleMap[ticker]) extras.push(ticker);
+  });
+  var missing = eligible.filter(function(t) { return !presentMap[normalizeTicker_(t)]; });
+  var result = { date: dateKey, expectedEligibleCount: eligible.length,
+    presentCount: Object.keys(presentMap).length, extras: extras.sort(), missing: missing.sort() };
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
 }
 
-function inspectOhlcvCacheDateAgainstCurrentRegistry() {
-  var targetDate = '2026-06-18';
+function inspectPendingMembershipEvents() {
+  var events = loadPendingMembershipEvents_();
+  Logger.log(JSON.stringify(events, null, 2));
 
+  writeSystemLog(
+    SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
+    'INFO',
+    '0s',
+    'Pending membership events inspected. Count=' + events.length + '. Check Apps Script Logger.'
+  );
+}
+
+function clearPendingMembershipEvents() {
+  savePendingMembershipEvents_([]);
+  Logger.log('Pending membership events cleared.');
+}
+
+function refreshSyncIndexFromDB() {
+  var startTime = Date.now();
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
   var registrySheet = getRegistrySheet_(ss);
 
-  var eligible = readEligibleTickerListFromRegistry_(registrySheet);
-  var eligibleMap = {};
-  eligible.forEach(function(t) {
-    eligibleMap[normalizeTicker_(t)] = true;
-  });
-
   var lastRow = dbSheet.getLastRow();
-  var values = dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).getValues();
+  if (lastRow < 2) throw new Error('DB_OHLCV is empty.');
 
-  var presentMap = {};
-  var extras = [];
+  var registryMap = loadRegistryMap_(registrySheet);
 
-  for (var i = 0; i < values.length; i++) {
-    var ticker = normalizeTicker_(values[i][0]);
-    var dateKey = normalizeDateKey_(values[i][1]);
-
-    if (dateKey !== targetDate || !ticker) continue;
-
-    presentMap[ticker] = true;
-
-    if (!eligibleMap[ticker]) {
-      extras.push(ticker);
-    }
-  }
-
-  var missing = [];
-  eligible.forEach(function(t) {
-    var ticker = normalizeTicker_(t);
-    if (!presentMap[ticker]) missing.push(ticker);
-  });
-
-  Logger.log(JSON.stringify({
-    date: targetDate,
-    expectedCurrentRegistryCount: eligible.length,
-    presentCount: Object.keys(presentMap).length,
-    extras: extras.sort(),
-    missing: missing.sort()
-  }, null, 2));
-}
-
-function adminDeleteBadRebalanceRows_20260618() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dbSheet = getDbSheet_(ss);
-
-  var targetDateKey = '2026-06-18';
-  var deleteTickers = {
-    FLEX: true,
-    MRVL: true
-  };
-
-  var lastRow = dbSheet.getLastRow();
-  if (lastRow < 2) {
-    Logger.log('OHLCV cache has no data rows.');
-    return;
-  }
-
-  var values = dbSheet
-    .getRange(2, 1, lastRow - 1, OHLCV_HEADER.length)
+  var data = dbSheet
+    .getRange(2, 1, lastRow - 1, 2)
     .getValues();
 
-  var rowsToDelete = [];
+  for (var i = 0; i < data.length; i++) {
+    var ticker = normalizeTicker_(data[i][0]);
+    var dateKey = normalizeDateKey_(data[i][1]);
 
-  for (var i = 0; i < values.length; i++) {
-    var ticker = normalizeTicker_(values[i][0]);
-    var dateKey = normalizeDateKey_(values[i][1]);
+    if (!ticker || !dateKey) continue;
 
-    if (dateKey === targetDateKey && deleteTickers[ticker]) {
-      rowsToDelete.push(i + 2);
+    if (!registryMap[ticker]) {
+      registryMap[ticker] = {
+        ticker: ticker,
+        isCurrentSP500: false,
+        isActive: true,
+        source: 'db-rebuild'
+      };
     }
+
+    if (!registryMap[ticker].lastSyncedDate || dateKey > registryMap[ticker].lastSyncedDate) {
+      registryMap[ticker].lastSyncedDate = dateKey;
+    }
+
+    registryMap[ticker].updatedAt = new Date();
   }
 
-  // Delete bottom-up so row numbers remain valid.
-  rowsToDelete.sort(function(a, b) {
-    return b - a;
-  });
+  saveRegistryMap_(registrySheet, registryMap);
 
-  for (var r = 0; r < rowsToDelete.length; r++) {
-    dbSheet.deleteRow(rowsToDelete[r]);
-  }
-
-  Logger.log(JSON.stringify({
-    date: targetDateKey,
-    deletedRows: rowsToDelete.length,
-    deletedRowNumbers: rowsToDelete
-  }, null, 2));
-
-  writeSystemLog(
-    'ADMIN',
-    rowsToDelete.length === 2 ? 'INFO' : 'WARN',
-    '0s',
-    'Deleted bad rebalance OHLCV rows. Date=' +
-      targetDateKey +
-      ', Tickers=FLEX,MRVL' +
-      ', DeletedRows=' +
-      rowsToDelete.length
+  logInfo_(
+    'SYNC_INDEX',
+    startTime,
+    'SYS_SYNC_INDEX rebuilt from DB_OHLCV. Registry tickers=' + Object.keys(registryMap).length
   );
 }
 
-function deriveRangeOnce() {
-  var startTime = Date.now();
-  var path = '/jobs/derive/range?from=2026-10-16&to=2026-10-22&limit=10&stopOnFail=false';
-  var res = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
-    method: 'post',
-    muteHttpExceptions: true,
-    headers: { Authorization: 'Bearer ' + getCloudflareIngestToken_() }
-  });
-  Logger.log('HTTP ' + res.getResponseCode());
-  Logger.log(res.getContentText());
-  writeSystemLog(SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
-    res.getResponseCode() === 200 ? 'INFO' : 'ERROR',
-    getElapsedSeconds_(startTime),
-    'Manual derive range 2026-10-16..22, HTTP=' + res.getResponseCode());
+function inspectLastDailyHealthGate() {
+  var text = PropertiesService
+    .getScriptProperties()
+    .getProperty(DAILY_LAST_HEALTH_PROP_KEY);
+
+  Logger.log(DAILY_LAST_HEALTH_PROP_KEY + ' = ' + text);
+
+  writeSystemLog(
+    SYS_CONFIG.DAILY_SYNC.LOG_MODULE,
+    'INFO',
+    '0s',
+    'Last daily health gate inspected. Check Apps Script Logger.'
+  );
 }
+
+function inspectDailySyncState() {
+  var stateText = PropertiesService
+    .getScriptProperties()
+    .getProperty(SYS_CONFIG.DAILY_SYNC.STATE_KEY);
+
+  Logger.log(SYS_CONFIG.DAILY_SYNC.STATE_KEY + ' = ' + stateText);
+
+  writeSystemLog(
+    SYS_CONFIG.DAILY_SYNC.LOG_MODULE,
+    'INFO',
+    '0s',
+    'Daily sync state inspected. Check Apps Script Logger.'
+  );
+}
+
+function resetDailySyncState() {
+  PropertiesService
+    .getScriptProperties()
+    .deleteProperty(SYS_CONFIG.DAILY_SYNC.STATE_KEY);
+
+  deleteTriggersByHandler_('dailySyncWorker');
+
+  writeSystemLog(
+    SYS_CONFIG.DAILY_SYNC.LOG_MODULE,
+    'WARN',
+    '0s',
+    'Daily sync state reset and worker trigger cleared.'
+  );
+}
+
+function createMissingAuditFormula(targetDateKeys) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = getOrCreateSheet_(ss, SYS_CONFIG.SHEETS.AUDIT_MISSING, null);
+  if (!targetDateKeys || targetDateKeys.length === 0) {
+    throw new Error('targetDateKeys required.');
+  }
+  sheet.clear();
+
+  var registryName = SYS_CONFIG.SHEETS.SYNC_INDEX;
+  var dbName = SYS_CONFIG.SHEETS.DB;
+
+  var blocks = [];
+
+  for (var i = 0; i < targetDateKeys.length; i++) {
+    var dateKey = normalizeDateKey_(targetDateKeys[i]);
+
+    blocks.push(
+      'IFNA(FILTER({' +
+        registryName + '!A2:A,IF(' + registryName + '!A2:A<>"","' + dateKey + '",)' +
+      '},' +
+        registryName + '!A2:A<>"",' +
+        registryName + '!H2:H=TRUE,' +
+        registryName + '!I2:I=TRUE,' +
+        'ISNA(MATCH(' +
+          registryName + '!A2:A&"|' + dateKey + '",' +
+          dbName + '!A:A&"|"&TEXT(' + dbName + '!B:B,"yyyy-mm-dd"),' +
+          '0' +
+        '))' +
+      '),{"",""})'
+    );
+  }
+
+  var formula =
+    '={"Ticker","MissingDate";' +
+      'QUERY({' + blocks.join(';') + '},' +
+      '"select Col1, Col2 where Col1 is not null",' +
+      '0)' +
+    '}';
+
+  sheet.getRange('A1').setFormula(formula);
+  sheet.setFrozenRows(1);
+
+  writeSystemLog(
+    'AUDIT_OHLCV',
+    'INFO',
+    '0s',
+    'Missing audit formula created for current eligible tickers. Dates=' +
+      targetDateKeys.join(', ')
+  );
+}
+
+function countAuditMissingRows() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SYS_CONFIG.SHEETS.AUDIT_MISSING);
+  if (!sheet) throw new Error('Missing sheet: ' + SYS_CONFIG.SHEETS.AUDIT_MISSING);
+
+  var count = Math.max(sheet.getLastRow() - 1, 0);
+
+  writeSystemLog(
+    'AUDIT_OHLCV',
+    count === 0 ? 'INFO' : 'WARN',
+    '0s',
+    'Current formula audit missing rows=' + count
+  );
+
+  return count;
+}
+
+/**
+ * Legacy callbacks: remove stale triggers only; never run or clear old jobs.
+ */
+function stopLegacyWorkerTrigger_(handlerName) {
+  var deleted = deleteTriggersByHandler_(handlerName);
+  writeSystemLog('ADMIN', 'WARN', '0s',
+    'Retired legacy worker trigger. Handler=' + handlerName + ', Deleted=' + deleted);
+}
+function backfillMissingWorker() { stopLegacyWorkerTrigger_('backfillMissingWorker'); }
+function runMissingOnlyBackfillBatch() { stopLegacyWorkerTrigger_('runMissingOnlyBackfillBatch'); }
+function backfillRangeWorker() { stopLegacyWorkerTrigger_('backfillRangeWorker'); }
+
+function inspectTriggerSetup() {
+  var result = buildTriggerSetupSnapshot_();
+
+  Logger.log(JSON.stringify(result, null, 2));
+
+  writeSystemLog(
+    'TRIGGER_SETUP',
+    'INFO',
+    '0s',
+    'Trigger setup inspected. ProductionTriggers=' +
+      result.productionTriggers.length +
+      ', WorkerTriggers=' +
+      result.workerTriggers.length +
+      ', OtherTriggers=' +
+      result.otherTriggers.length +
+      ', BlockingStates=' +
+      result.blockingStates.length
+  );
+
+  return result;
+}
+
+function inspectLastCloudflareOhlcvPush() {
+  var text = PropertiesService.getScriptProperties().getProperty(CF_LAST_OHLCV_PUSH_PROP_KEY);
+  Logger.log(CF_LAST_OHLCV_PUSH_PROP_KEY + ' = ' + text);
+  writeSystemLog(SYS_CONFIG.CLOUDFLARE.LOG_MODULE, 'INFO', '0s',
+    'Last Cloudflare OHLCV push inspected. Check Apps Script Logger.');
+}
+
+function backfillV2_RunNextBatch() { stopLegacyWorkerTrigger_('backfillV2_RunNextBatch'); }
+function continueBackfillOHLCV() { stopLegacyWorkerTrigger_('continueBackfillOHLCV'); }
+function continueDailyIncrementalSync() { stopLegacyWorkerTrigger_('continueDailyIncrementalSync'); }
+function cloudflareHistoricalOhlcvWorker() { stopLegacyWorkerTrigger_('cloudflareHistoricalOhlcvWorker'); }
+function cloudflareOhlcvSyncWorker() { stopLegacyWorkerTrigger_('cloudflareOhlcvSyncWorker'); }

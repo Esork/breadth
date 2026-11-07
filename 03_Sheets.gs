@@ -75,11 +75,6 @@ function readTickerList_(ignoredSheet) {
  * Backward compatible:
  * Existing callers expect a number, so this returns appendedRows.
  */
-function appendOhlcvRows_(dbSheet, rows, options) {
-  var result = appendOhlcvRowsDetailed_(dbSheet, rows, options);
-  return result.appendedRows;
-}
-
 /**
  * Exact small-batch OHLCV append.
  *
