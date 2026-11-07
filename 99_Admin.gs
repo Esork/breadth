@@ -138,3 +138,19 @@ function adminDeleteBadRebalanceRows_20260618() {
       rowsToDelete.length
   );
 }
+
+function deriveRangeOnce() {
+  var startTime = Date.now();
+  var path = '/jobs/derive/range?from=2026-10-16&to=2026-10-22&limit=10&stopOnFail=false';
+  var res = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
+    method: 'post',
+    muteHttpExceptions: true,
+    headers: { Authorization: 'Bearer ' + getCloudflareIngestToken_() }
+  });
+  Logger.log('HTTP ' + res.getResponseCode());
+  Logger.log(res.getContentText());
+  writeSystemLog(SYS_CONFIG.CLOUDFLARE.LOG_MODULE,
+    res.getResponseCode() === 200 ? 'INFO' : 'ERROR',
+    getElapsedSeconds_(startTime),
+    'Manual derive range 2026-10-16..22, HTTP=' + res.getResponseCode());
+}
