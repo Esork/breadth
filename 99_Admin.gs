@@ -509,6 +509,7 @@ function buildNov2026OhlcvRecoveryPlan_() {
   var cacheDateCounts = {};
   var eligibleByDate = {};
   var tickerUnion = {};
+  var scannedDates = NOV2026_OHLCV_RECOVERY_DATES_.concat(['2026-11-06']);
 
   NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
     eligibleByDate[dateKey] = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
@@ -516,11 +517,13 @@ function buildNov2026OhlcvRecoveryPlan_() {
       tickerUnion[normalizeTicker_(ticker)] = true;
     });
   });
+  eligibleByDate['2026-11-06'] =
+    readEligibleTickerListForOhlcvDate_(registrySheet, '2026-11-06');
 
   for (var i = 0; i < values.length; i++) {
     var ticker = normalizeTicker_(values[i][0]);
     var dateKey = normalizeDateKey_(values[i][1]);
-    if (!ticker || NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) < 0) continue;
+    if (!ticker || scannedDates.indexOf(dateKey) < 0) continue;
     var key = ticker + '|' + dateKey;
     if (cacheMap[key]) {
       duplicateKeys.push(key);
@@ -530,8 +533,7 @@ function buildNov2026OhlcvRecoveryPlan_() {
     cacheDateCounts[dateKey] = (cacheDateCounts[dateKey] || 0) + 1;
   }
 
-  var dateReports = [];
-  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
+  function summarizeDate_(dateKey) {
     var eligible = eligibleByDate[dateKey];
     var missing = [];
     var invalid = [];
@@ -554,8 +556,7 @@ function buildNov2026OhlcvRecoveryPlan_() {
     });
 
     extras.sort();
-    var d1Quality = fetchNov2026CloudflareQuality_(dateKey);
-    dateReports.push({
+    return {
       date: dateKey,
       localExpected: eligible.length,
       localValid: validCount,
@@ -564,19 +565,28 @@ function buildNov2026OhlcvRecoveryPlan_() {
       localExtras: extras.length,
       missingSamples: missing.slice(0, 25),
       invalidSamples: invalid.slice(0, 25),
-      extraSamples: extras.slice(0, 25),
-      d1Quality: d1Quality
-    });
+      extraSamples: extras.slice(0, 25)
+    };
+  }
+
+  var dateReports = NOV2026_OHLCV_RECOVERY_DATES_.map(function(dateKey) {
+    var report = summarizeDate_(dateKey);
+    report.d1Quality = fetchNov2026CloudflareQuality_(dateKey);
+    return report;
   });
+
+  var referenceReport = summarizeDate_('2026-11-06');
+  referenceReport.d1Quality = fetchNov2026CloudflareQuality_('2026-11-06');
 
   return {
     scope: NOV2026_OHLCV_RECOVERY_DATES_.slice(),
+    referenceDate: referenceReport,
     cacheRowsByDate: cacheDateCounts,
     duplicateKeyCount: duplicateKeys.length,
     duplicateKeySamples: duplicateKeys.slice(0, 30),
     tickerUnion: Object.keys(tickerUnion).sort(),
     dates: dateReports,
-    note: 'Every eligible ticker/date in scope will be re-fetched from GoogleFinance, including existing 11/4 and 11/5 rows. 11/6 and all other cache rows are untouched.'
+    note: 'Every eligible ticker/date from 11/2 through 11/5 will be re-fetched from GoogleFinance, including existing 11/4 and 11/5 rows. 11/6 is checked as a reference and is never modified.'
   };
 }
 
@@ -599,6 +609,15 @@ function assertNov2026RecoveryPlanSafe_(plan) {
         (item.d1Quality ? item.d1Quality.expected_count : 'unavailable'));
     }
   });
+
+  var ref = plan.referenceDate;
+  if (!ref || !ref.d1Quality || ref.d1Quality.status !== 'OK' ||
+      ref.localMissing !== 0 || ref.localInvalid !== 0 || ref.localExtras !== 0 ||
+      ref.localValid !== ref.localExpected ||
+      ref.d1Quality.expected_count !== ref.localExpected) {
+    throw new Error('11/6 reference data is not fully healthy locally and in D1: ' +
+      JSON.stringify(ref));
+  }
 }
 
 function runNov2026OhlcvRecoveryFetchBatch_(state, startedAt) {
