@@ -333,13 +333,19 @@ function startNov2026OhlcvRecovery() {
     dates: NOV2026_OHLCV_RECOVERY_DATES_.slice(),
     tickers: plan.tickerUnion,
     cursor: 0,
+    dateCursor: 0,
     attempts: {},
     startedAt: new Date().toISOString(),
     lastError: null
   };
 
   props.setProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
-  installEveryMinutesTrigger_('runNov2026OhlcvRecoveryWorker', 1);
+  try {
+    installEveryMinutesTrigger_('runNov2026OhlcvRecoveryWorker', 1);
+  } catch (err) {
+    props.deleteProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_);
+    throw new Error('Could not install recovery trigger; recovery state was cleared. ' + String(err));
+  }
   Logger.log('Recovery started. Tickers=' + state.tickers.length +
     ', dates=' + state.dates.join(', ') + '. Dedicated worker trigger installed.');
   return { started: true, tickerCount: state.tickers.length, dates: state.dates };
@@ -428,7 +434,14 @@ function resumeNov2026OhlcvRecovery() {
     delete state.attempts[state.tickers[state.cursor]];
   }
   props.setProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
-  installEveryMinutesTrigger_('runNov2026OhlcvRecoveryWorker', 1);
+  try {
+    installEveryMinutesTrigger_('runNov2026OhlcvRecoveryWorker', 1);
+  } catch (err) {
+    state.status = 'FAILED';
+    state.lastError = 'Could not reinstall recovery trigger: ' + String(err);
+    props.setProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_, JSON.stringify(state));
+    throw err;
+  }
   Logger.log('Recovery resumed at phase=' + state.phase + ', cursor=' +
     (state.phase === 'FETCH' ? state.cursor + '/' + state.tickers.length :
       Number(state.dateCursor || 0) + '/' + state.dates.length));
@@ -498,6 +511,25 @@ function verifyNov2026OhlcvRecovery() {
     },
     lastRun: parseJsonSafe_(props.getProperty(NOV2026_OHLCV_RECOVERY_LAST_KEY_), null),
     results: results
+  };
+  Logger.log(JSON.stringify(output, null, 2));
+  return output;
+}
+
+function inspectNov2026OhlcvRecoveryState() {
+  var props = PropertiesService.getScriptProperties();
+  var output = {
+    activeState: parseJsonSafe_(props.getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_), null),
+    lastRun: parseJsonSafe_(props.getProperty(NOV2026_OHLCV_RECOVERY_LAST_KEY_), null),
+    triggers: ScriptApp.getProjectTriggers().filter(function(t) {
+      return t.getHandlerFunction() === 'runNov2026OhlcvRecoveryWorker';
+    }).map(function(t) {
+      return {
+        handler: t.getHandlerFunction(),
+        eventType: String(t.getEventType()),
+        source: String(t.getTriggerSource())
+      };
+    })
   };
   Logger.log(JSON.stringify(output, null, 2));
   return output;
