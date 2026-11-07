@@ -58,7 +58,8 @@ function getKnownWorkerTriggerHandlers_() {
 
     // Future Cloudflare worker names. Safe to include before they exist.
     'cloudflareHistoricalOhlcvWorker',
-    'cloudflareOhlcvSyncWorker'
+    'cloudflareOhlcvSyncWorker',
+    'runNov2026OhlcvRecoveryWorker'
   ];
 }
 
