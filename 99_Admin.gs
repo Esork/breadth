@@ -636,6 +636,11 @@ function assertNov2026RecoveryPlanSafe_(plan) {
         '. Local=' + item.localExpected + ', D1=' +
         (item.d1Quality ? item.d1Quality.expected_count : 'unavailable'));
     }
+    if (Number(item.d1Quality.extra_count || 0) > 0 ||
+        Number(item.d1Quality.duplicate_extra_rows || 0) > 0) {
+      throw new Error('D1 already contains extra/duplicate raw rows for ' + item.date +
+        '. Recovery will not delete existing D1 data: ' + JSON.stringify(item.d1Quality));
+    }
   });
 
   var ref = plan.referenceDate;
