@@ -460,51 +460,6 @@ function finishDailySyncWithHealthGate_(state, totalTickers, startTime) {
   );
 }
 
-function inspectLastDailyHealthGate() {
-  var text = PropertiesService
-    .getScriptProperties()
-    .getProperty(DAILY_LAST_HEALTH_PROP_KEY);
-
-  Logger.log(DAILY_LAST_HEALTH_PROP_KEY + ' = ' + text);
-
-  writeSystemLog(
-    SYS_CONFIG.DAILY_SYNC.LOG_MODULE,
-    'INFO',
-    '0s',
-    'Last daily health gate inspected. Check Apps Script Logger.'
-  );
-}
-
-function inspectDailySyncState() {
-  var stateText = PropertiesService
-    .getScriptProperties()
-    .getProperty(SYS_CONFIG.DAILY_SYNC.STATE_KEY);
-
-  Logger.log(SYS_CONFIG.DAILY_SYNC.STATE_KEY + ' = ' + stateText);
-
-  writeSystemLog(
-    SYS_CONFIG.DAILY_SYNC.LOG_MODULE,
-    'INFO',
-    '0s',
-    'Daily sync state inspected. Check Apps Script Logger.'
-  );
-}
-
-function resetDailySyncState() {
-  PropertiesService
-    .getScriptProperties()
-    .deleteProperty(SYS_CONFIG.DAILY_SYNC.STATE_KEY);
-
-  deleteTriggersByHandler_('dailySyncWorker');
-
-  writeSystemLog(
-    SYS_CONFIG.DAILY_SYNC.LOG_MODULE,
-    'WARN',
-    '0s',
-    'Daily sync state reset and worker trigger cleared.'
-  );
-}
-
 /* Backward-compatible wrapper. */
 function dailyIncrementalSync() {
   startDailySyncNow();

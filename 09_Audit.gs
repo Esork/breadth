@@ -8,9 +8,6 @@
  * - Do not create random incident-specific audit sheets.
  */
 
-function createMissingAuditFormula_Jun3_Jun4_2026() {
-  createMissingAuditFormula(['2026-06-03', '2026-06-04']);
-}
 
 /**
  * Creates/refreshes AUDIT_MISSING_OHLCV.
@@ -23,75 +20,6 @@ function createMissingAuditFormula_Jun3_Jun4_2026() {
  * For rebalance-transition dates, prefer script health inspector / date-aware
  * helpers instead of relying on this formula audit alone.
  */
-function createMissingAuditFormula(targetDateKeys) {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = getOrCreateSheet_(ss, SYS_CONFIG.SHEETS.AUDIT_MISSING, null);
-  sheet.clear();
-
-  if (!targetDateKeys || targetDateKeys.length === 0) {
-    throw new Error('targetDateKeys required.');
-  }
-
-  var registryName = SYS_CONFIG.SHEETS.SYNC_INDEX || SYS_CONFIG.SHEETS.TICKERS;
-  var dbName = SYS_CONFIG.SHEETS.DB;
-
-  var blocks = [];
-
-  for (var i = 0; i < targetDateKeys.length; i++) {
-    var dateKey = normalizeDateKey_(targetDateKeys[i]);
-
-    blocks.push(
-      'IFNA(FILTER({' +
-        registryName + '!A2:A,IF(' + registryName + '!A2:A<>"","' + dateKey + '",)' +
-      '},' +
-        registryName + '!A2:A<>"",' +
-        registryName + '!H2:H=TRUE,' +
-        registryName + '!I2:I=TRUE,' +
-        'ISNA(MATCH(' +
-          registryName + '!A2:A&"|' + dateKey + '",' +
-          dbName + '!A:A&"|"&TEXT(' + dbName + '!B:B,"yyyy-mm-dd"),' +
-          '0' +
-        '))' +
-      '),{"",""})'
-    );
-  }
-
-  var formula =
-    '={"Ticker","MissingDate";' +
-      'QUERY({' + blocks.join(';') + '},' +
-      '"select Col1, Col2 where Col1 is not null",' +
-      '0)' +
-    '}';
-
-  sheet.getRange('A1').setFormula(formula);
-  sheet.setFrozenRows(1);
-
-  writeSystemLog(
-    'AUDIT_OHLCV',
-    'INFO',
-    '0s',
-    'Missing audit formula created for current eligible tickers. Dates=' +
-      targetDateKeys.join(', ')
-  );
-}
-
-function countAuditMissingRows() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName(SYS_CONFIG.SHEETS.AUDIT_MISSING);
-  if (!sheet) throw new Error('Missing sheet: ' + SYS_CONFIG.SHEETS.AUDIT_MISSING);
-
-  var count = Math.max(sheet.getLastRow() - 1, 0);
-
-  writeSystemLog(
-    'AUDIT_OHLCV',
-    count === 0 ? 'INFO' : 'WARN',
-    '0s',
-    'Current formula audit missing rows=' + count
-  );
-
-  return count;
-}
-
 function inspectLatestOhlcvDateHealth() {
   return inspectLatestOhlcvDateHealthFast_(2000);
 }

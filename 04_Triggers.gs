@@ -48,6 +48,7 @@ function getKnownWorkerTriggerHandlers_() {
   return [
     'dailySyncWorker',
     'backfillMissingWorker',
+    'backfillRangeWorker',
 
     // Legacy / emergency-era handlers.
     'runMissingOnlyBackfillBatch',
@@ -114,8 +115,7 @@ function clearProductionTriggers() {
  * If a stale worker state is intentionally safe to clear, run the relevant
  * reset function first:
  *
- * - resetDailySyncState()
- * - inspectMissingBackfillState() / then manually clear if confirmed stale
+ * - inspectAllActiveStates() in 99_Admin.gs; clear only the specific stale state
  */
 function installProductionTriggers() {
   assertNoActiveWorkerStatesForProduction_();
@@ -157,28 +157,6 @@ function installProductionTriggers() {
  * Public inspection helper.
  * Use before installing production triggers.
  */
-function inspectTriggerSetup() {
-  var result = buildTriggerSetupSnapshot_();
-
-  Logger.log(JSON.stringify(result, null, 2));
-
-  writeSystemLog(
-    'TRIGGER_SETUP',
-    'INFO',
-    '0s',
-    'Trigger setup inspected. ProductionTriggers=' +
-      result.productionTriggers.length +
-      ', WorkerTriggers=' +
-      result.workerTriggers.length +
-      ', OtherTriggers=' +
-      result.otherTriggers.length +
-      ', BlockingStates=' +
-      result.blockingStates.length
-  );
-
-  return result;
-}
-
 function assertNoActiveWorkerStatesForProduction_() {
   var snapshot = buildTriggerSetupSnapshot_();
 
@@ -236,13 +214,11 @@ function getBlockingWorkerStatesForProduction_() {
     });
   }
 
-  var backfillStateText = props.getProperty(SYS_CONFIG.BACKFILL.STATE_KEY);
-  if (backfillStateText) {
-    states.push({
-      key: SYS_CONFIG.BACKFILL.STATE_KEY,
-      state: parseJsonSafe_(backfillStateText, backfillStateText)
-    });
-  }
+  Object.keys(LEGACY_WORKER_STATE_KEYS).forEach(function(name) {
+    var key = LEGACY_WORKER_STATE_KEYS[name];
+    var stateText = props.getProperty(key);
+    if (stateText) states.push({ key: key, state: parseJsonSafe_(stateText, stateText) });
+  });
 
   return states;
 }

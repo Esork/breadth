@@ -220,52 +220,6 @@ function isDateAlreadySynced_(lastSyncedDateKey, newDateKey) {
  * Heavy maintenance function. Run manually only after a major DB repair.
  * It scans DB_OHLCV once and rebuilds LastSyncedDate in SYS_SYNC_INDEX.
  */
-function refreshSyncIndexFromDB() {
-  var startTime = Date.now();
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var dbSheet = getDbSheet_(ss);
-  var registrySheet = getRegistrySheet_(ss);
-
-  var lastRow = dbSheet.getLastRow();
-  if (lastRow < 2) throw new Error('DB_OHLCV is empty.');
-
-  var registryMap = loadRegistryMap_(registrySheet);
-
-  var data = dbSheet
-    .getRange(2, 1, lastRow - 1, 2)
-    .getValues();
-
-  for (var i = 0; i < data.length; i++) {
-    var ticker = normalizeTicker_(data[i][0]);
-    var dateKey = normalizeDateKey_(data[i][1]);
-
-    if (!ticker || !dateKey) continue;
-
-    if (!registryMap[ticker]) {
-      registryMap[ticker] = {
-        ticker: ticker,
-        isCurrentSP500: false,
-        isActive: true,
-        source: 'db-rebuild'
-      };
-    }
-
-    if (!registryMap[ticker].lastSyncedDate || dateKey > registryMap[ticker].lastSyncedDate) {
-      registryMap[ticker].lastSyncedDate = dateKey;
-    }
-
-    registryMap[ticker].updatedAt = new Date();
-  }
-
-  saveRegistryMap_(registrySheet, registryMap);
-
-  logInfo_(
-    'SYNC_INDEX',
-    startTime,
-    'SYS_SYNC_INDEX rebuilt from DB_OHLCV. Registry tickers=' + Object.keys(registryMap).length
-  );
-}
-
 var SP500_MEMBERSHIP_EVENTS = [
   {
     effectiveDate: '2026-06-22',
@@ -360,33 +314,3 @@ function readDailySyncCandidateTickerList_(registrySheet) {
   return Object.keys(map).sort();
 }
 
-function inspectDateAwareUniverseTest() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var registrySheet = getRegistrySheet_(ss);
-
-  var dates = ['2026-06-18', '2026-06-22'];
-  var output = {
-    currentEligibleCount: readEligibleTickerListFromRegistry_(registrySheet).length,
-    dailySyncCandidateCount: readDailySyncCandidateTickerList_(registrySheet).length,
-    byDate: {}
-  };
-
-  dates.forEach(function(dateKey) {
-    var list = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
-    var map = {};
-
-    list.forEach(function(ticker) {
-      map[ticker] = true;
-    });
-
-    output.byDate[dateKey] = {
-      count: list.length,
-      hasCPB: !!map.CPB,
-      hasPOOL: !!map.POOL,
-      hasMRVL: !!map.MRVL,
-      hasFLEX: !!map.FLEX
-    };
-  });
-
-  Logger.log(JSON.stringify(output, null, 2));
-}

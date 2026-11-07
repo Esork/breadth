@@ -6,13 +6,11 @@
 
 const SYS_CONFIG = {
   SHEETS: {
-    TICKERS: 'SYS_SYNC_INDEX',
     DB: 'daily_OHLCV_CACHE',
     BUFFER: 'SYS_TEMP_BUFFER',
     LOGS: 'SYS_LOGS',
     SYNC_INDEX: 'SYS_SYNC_INDEX',
-    AUDIT_MISSING: 'AUDIT_MISSING_OHLCV',
-    BACKFILL_QUEUE: 'SYS_BACKFILL_QUEUE'
+    AUDIT_MISSING: 'AUDIT_MISSING_OHLCV'
   },
 
   SOURCES: {
@@ -41,18 +39,6 @@ const SYS_CONFIG = {
     LOG_MODULE: 'TICKER_SYNC'
   },
 
-  BACKFILL: {
-    STATE_KEY: 'QE_MISSING_BACKFILL_STATE_V3',
-    BATCH_TICKERS: 10,
-    WORKER_EVERY_MINUTES: 5,
-    LOG_MODULE: 'MISSING_BACKFILL'
-  },
-
-  LOGS: {
-    MAX_ROWS: 5000,
-    TRIM_ROWS: 100
-  },
-
   CLOUDFLARE: {
     BASE_URL: "https://breadth-db-api.kamarski.workers.dev",
     BATCH_SIZE: 100,
@@ -60,15 +46,11 @@ const SYS_CONFIG = {
   },
 };
 
+const LEGACY_WORKER_STATE_KEYS = {
+  MISSING_BACKFILL: 'QE_MISSING_BACKFILL_STATE_V3',
+  RANGE_BACKFILL: 'QE_BACKFILL_RANGE_STATE_V1'
+};
+
 const OHLCV_HEADER = ['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume'];
 const SYNC_INDEX_HEADER = ['Ticker', 'LastSyncedDate'];
 const LOG_HEADER = ['Timestamp', 'Module', 'Level', 'Execution_Time', 'Message'];
-const BACKFILL_QUEUE_HEADER = ['Ticker', 'MissingDate', 'Status', 'Message', 'UpdatedAt'];
-
-const BACKFILL_STATUS = {
-  PENDING: '',
-  DONE: 'DONE',
-  DUPLICATE: 'DUPLICATE',
-  SKIPPED: 'SKIPPED',
-  FAILED: 'FAILED'
-};
