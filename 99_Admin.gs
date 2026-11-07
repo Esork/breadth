@@ -440,34 +440,62 @@ function verifyNov2026OhlcvRecovery() {
   var active = props.getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_);
   if (active) throw new Error('Recovery is still active or paused. Inspect state before verification.');
 
+  var plan = buildNov2026OhlcvRecoveryPlan_();
   var results = [];
   var allOk = true;
-  for (var i = 0; i < NOV2026_OHLCV_RECOVERY_DATES_.length; i++) {
-    var dateKey = NOV2026_OHLCV_RECOVERY_DATES_[i];
-    var quality = fetchNov2026CloudflareQuality_(dateKey);
-    var dashboard = fetchNov2026CloudflareJson_('/api/dashboard?date=' + encodeURIComponent(dateKey));
+
+  plan.dates.forEach(function(item) {
+    var dashboard = fetchNov2026CloudflareJson_('/api/dashboard?date=' + encodeURIComponent(item.date));
     var marketRows = dashboard.data && dashboard.data.market ? 1 : 0;
     var sectorRows = dashboard.data && dashboard.data.sectors ? dashboard.data.sectors.length : 0;
     var runs = dashboard.data && dashboard.data.calculation_runs ? dashboard.data.calculation_runs : [];
     var deriveDone = runs.some(function(run) {
       return run.job_type === 'DERIVE_DAILY_BREADTH' && run.status === 'DONE';
     });
-    var ok = quality.status === 'OK' &&
-      quality.missing_count === 0 &&
-      quality.extra_count === 0 &&
-      quality.duplicate_extra_rows === 0 &&
-      marketRows === 1 && sectorRows > 0 && deriveDone;
+    var localOk = item.localMissing === 0 && item.localInvalid === 0 &&
+      item.localValid === item.localExpected;
+    var d1Ok = item.d1Quality.status === 'OK' &&
+      item.d1Quality.missing_count === 0 &&
+      item.d1Quality.extra_count === 0 &&
+      item.d1Quality.duplicate_extra_rows === 0;
+    var derivedOk = marketRows === 1 && sectorRows > 0 && deriveDone;
+    var ok = localOk && d1Ok && derivedOk;
     if (!ok) allOk = false;
     results.push({
-      date: dateKey,
+      date: item.date,
       ok: ok,
-      quality: quality,
+      local: {
+        expected: item.localExpected,
+        valid: item.localValid,
+        missing: item.localMissing,
+        invalid: item.localInvalid,
+        extras: item.localExtras
+      },
+      d1Quality: item.d1Quality,
       derived: { marketRows: marketRows, sectorRows: sectorRows, deriveDone: deriveDone }
     });
-  }
+  });
+
+  var ref = plan.referenceDate;
+  var referenceOk = ref.localMissing === 0 && ref.localInvalid === 0 &&
+    ref.localExtras === 0 && ref.localValid === ref.localExpected &&
+    ref.d1Quality.status === 'OK';
+  if (!referenceOk) allOk = false;
 
   var output = {
     ok: allOk,
+    referenceDate: {
+      date: ref.date,
+      ok: referenceOk,
+      local: {
+        expected: ref.localExpected,
+        valid: ref.localValid,
+        missing: ref.localMissing,
+        invalid: ref.localInvalid,
+        extras: ref.localExtras
+      },
+      d1Quality: ref.d1Quality
+    },
     lastRun: parseJsonSafe_(props.getProperty(NOV2026_OHLCV_RECOVERY_LAST_KEY_), null),
     results: results
   };
