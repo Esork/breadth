@@ -74,5 +74,8 @@ function convertTickerForGoogleFinance_(ticker) {
   var value = normalizeTicker_(ticker);
   if (value === 'BRK-B') return 'BRK.B';
   if (value === 'BF-B') return 'BF.B';
+  // KVUE is NYSE-listed; explicit exchange qualification avoids ambiguous
+  // GOOGLEFINANCE symbol resolution during historical recovery.
+  if (value === 'KVUE') return 'NYSE:KVUE';
   return value;
 }
