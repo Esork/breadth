@@ -164,6 +164,9 @@ export default {
       if (path === "/ingest/membership" && request.method === "POST") {
         return handleIngestMembershipEvents(request, env);
       }
+      if (path === "/admin/recovery/nov2026/remove-okta" && request.method === "POST") {
+        return handleNov2026RemoveOktaRecoveryRows(env);
+      }
       return json({
         ok: false,
         error: "Not found",
@@ -2412,6 +2415,58 @@ function buildOhlcvUpsertStatement(env, table, row) {
 /* -----------------------------
  * Bucket helpers
  * ----------------------------- */
+
+
+/**
+ * One-off, tightly scoped repair for the November 2026 membership mismatch.
+ * Deletes only OKTA rows for 2026-11-02..2026-11-05 from both OHLCV tables.
+ * Requires the normal INGEST_TOKEN bearer auth.
+ */
+async function handleNov2026RemoveOktaRecoveryRows(env) {
+  const dates = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"];
+  const tables = [getCurrentOhlcvReadTable(), LEGACY_OHLCV_TABLE];
+  const before = {};
+  const statements = [];
+
+  for (const table of tables) {
+    assertAllowedOhlcvTable(table);
+    before[table] = {};
+    for (const date of dates) {
+      const count = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE ticker = ? AND date = ?`
+      ).bind("OKTA", date).all();
+      before[table][date] = Number(count.results[0] && count.results[0].n || 0);
+      statements.push(env.DB.prepare(
+        `DELETE FROM ${table} WHERE ticker = ? AND date = ?`
+      ).bind("OKTA", date));
+    }
+  }
+
+  const results = await env.DB.batch(statements);
+  const after = {};
+  for (const table of tables) {
+    after[table] = {};
+    for (const date of dates) {
+      const count = await env.DB.prepare(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE ticker = ? AND date = ?`
+      ).bind("OKTA", date).all();
+      after[table][date] = Number(count.results[0] && count.results[0].n || 0);
+    }
+  }
+
+  const remaining = Object.values(after).some((byDate) =>
+    Object.values(byDate).some((n) => n !== 0)
+  );
+  return json({
+    ok: !remaining,
+    operation: "nov2026_scoped_okta_cleanup",
+    deleted_rows_reported: results.reduce((sum, item) =>
+      sum + Number(item && item.meta && (item.meta.changes || item.meta.rows_written) || 0), 0),
+    before,
+    after,
+    scope: { ticker: "OKTA", dates, tables }
+  }, CORS_HEADERS, remaining ? 500 : 200);
+}
 
 function getCurrentOhlcvReadTable() {
   return "ohlcv_daily_2024_2027";
