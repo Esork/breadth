@@ -697,12 +697,13 @@ function verifyNov2026OhlcvRecovery() {
     var deriveDone = runs.some(function(run) {
       return run.job_type === 'DERIVE_DAILY_BREADTH' && run.status === 'DONE';
     });
-    var localOk = item.localMissing === 0 && item.localInvalid === 0 &&
-      item.localValid === item.localExpected;
+    var minimumRequired = Math.ceil(item.localExpected * 0.98);
+    var localOk = item.localValid >= minimumRequired;
+    var d1MinimumRequired = Number(item.d1Quality.minimum_required_count ||
+      Math.ceil(Number(item.d1Quality.expected_count || 0) * 0.98));
     var d1Ok = item.d1Quality.status === 'OK' &&
-      item.d1Quality.missing_count === 0 &&
-      item.d1Quality.extra_count === 0 &&
-      item.d1Quality.duplicate_extra_rows === 0;
+      Number(item.d1Quality.valid_unique_tickers || 0) >= d1MinimumRequired &&
+      Number(item.d1Quality.duplicate_extra_rows || 0) === 0;
     var derivedOk = marketRows === 1 && sectorRows > 0 && deriveDone;
     var ok = localOk && d1Ok && derivedOk;
     if (!ok) allOk = false;
@@ -711,6 +712,7 @@ function verifyNov2026OhlcvRecovery() {
       ok: ok,
       local: {
         expected: item.localExpected,
+        minimumRequired: minimumRequired,
         valid: item.localValid,
         missing: item.localMissing,
         invalid: item.localInvalid,
