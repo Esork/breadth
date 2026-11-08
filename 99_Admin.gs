@@ -455,6 +455,7 @@ function resumeNov2026OhlcvRecovery() {
 function inspectNov2026MembershipMismatch() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var registrySheet = getRegistrySheet_(ss);
+  var registryMap = loadRegistryMap_(registrySheet);
   var reports = [];
 
   NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
@@ -482,11 +483,24 @@ function inspectNov2026MembershipMismatch() {
     });
   });
 
+  var registryRows = ['KVUE', 'OKTA'].map(function(ticker) {
+    var row = registryMap[ticker] || null;
+    if (!row) return { ticker: ticker, presentInRegistry: false };
+    return {
+      ticker: ticker,
+      presentInRegistry: true,
+      isCurrentSP500: row.isCurrentSP500,
+      isActive: row.isActive,
+      dateAdded: row.dateAdded,
+      dateRemoved: row.dateRemoved,
+      source: row.source
+    };
+  });
+
   var output = {
     readOnly: true,
-    activeRecoveryState: parseJsonSafe_(
-      PropertiesService.getScriptProperties().getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_), null
-    ),
+    localMembershipEvents: getSp500MembershipEvents_(),
+    registryRows: registryRows,
     reports: reports
   };
   Logger.log(JSON.stringify(output, null, 2));
