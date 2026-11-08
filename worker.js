@@ -192,7 +192,7 @@ function requiresWriteAuth(path) {
   return (
     path.startsWith("/ingest/") ||
     path.startsWith("/jobs/") ||
-    path === "/admin/recovery/nov2026/reconcile-membership"
+    (path === "/admin/recovery/nov2026/reconcile-membership" || path === "/admin/recovery/nov2026/inspect")
   );
 }
 
