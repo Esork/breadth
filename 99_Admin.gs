@@ -429,6 +429,20 @@ function repairNov2026MembershipMismatch() {
       .setValues(appendRows);
   }
 
+  Logger.log(JSON.stringify({
+    ok: true,
+    d1Membership: result,
+    localOktaRowsRemoved: deleteRows.length,
+    localKvueRowsAdded: appendRows.length,
+    next: 'Run resumeNov2026OhlcvRecovery() to ingest and quality-check each date.'
+  }, null, 2));
+  return {
+    ok: true,
+    d1Membership: result,
+    localOktaRowsRemoved: deleteRows.length,
+    localKvueRowsAdded: appendRows.length
+  };
+}
 
 function postNov2026RecoveryJson_(path, payload) {
   var response = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
