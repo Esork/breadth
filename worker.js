@@ -2059,31 +2059,28 @@ async function computeOhlcvQuality(env, indexCode, date) {
   const table = getCurrentOhlcvReadTable();
   assertAllowedOhlcvTable(table);
   const universe = await getUniverseForDate(env, indexCode, date);
-  const statsResult = await env.DB.prepare(
-    `SELECT ticker, open, high, low, close, volume, source, COUNT(*) AS row_count
-     FROM ${table} WHERE date = ?
-     GROUP BY ticker, open, high, low, close, volume, source ORDER BY ticker`
+  const rowsResult = await env.DB.prepare(
+    `SELECT ticker, open, high, low, close, volume, source
+     FROM ${table} WHERE date = ? ORDER BY ticker`
   ).bind(date).all();
 
   const expectedSet = new Set();
   const presentSet = new Set();
   const validSet = new Set();
+  const rowCounts = new Map();
   let rawRows = 0, duplicateExtraRows = 0, invalidRows = 0;
   const duplicateSamples = [], invalidSamples = [];
   for (const row of universe) {
     const ticker = normalizeTicker(row.ticker);
     if (ticker) expectedSet.add(ticker);
   }
-  for (const row of statsResult.results || []) {
+  for (const row of rowsResult.results || []) {
+    rawRows++;
     const ticker = normalizeTicker(row.ticker);
-    const count = Number(row.row_count || 0);
-    rawRows += count;
-    if (!ticker) { invalidRows += count; continue; }
+    if (!ticker) { invalidRows++; continue; }
     presentSet.add(ticker);
-    if (count > 1) {
-      duplicateExtraRows += count - 1;
-      if (duplicateSamples.length < 20) duplicateSamples.push(`${ticker} x${count}`);
-    }
+    rowCounts.set(ticker, (rowCounts.get(ticker) || 0) + 1);
+
     const values = [row.open, row.high, row.low, row.close, row.volume].map(Number);
     const [open, high, low, close, volume] = values;
     const source = String(row.source || "").toUpperCase();
@@ -2094,8 +2091,14 @@ async function computeOhlcvQuality(env, indexCode, date) {
       source !== "CORPORATE_ACTION_CARRY_FORWARD";
     if (valid) validSet.add(ticker);
     else {
-      invalidRows += count;
+      invalidRows++;
       if (invalidSamples.length < 20) invalidSamples.push(ticker);
+    }
+  }
+  for (const [ticker, count] of rowCounts.entries()) {
+    if (count > 1) {
+      duplicateExtraRows += count - 1;
+      if (duplicateSamples.length < 20) duplicateSamples.push(`${ticker} x${count}`);
     }
   }
 
