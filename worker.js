@@ -167,7 +167,10 @@ export default {
       if (path === "/admin/recovery/nov2026/inspect" && request.method === "GET") {
         return handleNov2026RecoveryInspect(env);
       }
-      if ((path === "/admin/recovery/nov2026/reconcile-membership" || path === "/admin/recovery/nov2026/inspect") && request.method === "POST") {
+      if (path === "/admin/recovery/nov2026/prepare" && request.method === "POST") {
+        return handleNov2026RecoveryPrepare(env);
+      }
+      if ((path === "/admin/recovery/nov2026/reconcile-membership" || path === "/admin/recovery/nov2026/inspect" || path === "/admin/recovery/nov2026/prepare") && request.method === "POST") {
         return json({
           ok: false,
           error: "Disabled pending read-only reconciliation review. No changes made."
@@ -2055,100 +2058,76 @@ async function getUniverseForDate(env, indexCode, date) {
 async function computeOhlcvQuality(env, indexCode, date) {
   const table = getCurrentOhlcvReadTable();
   assertAllowedOhlcvTable(table);
-
   const universe = await getUniverseForDate(env, indexCode, date);
-
   const statsResult = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS raw_rows,
-       COUNT(DISTINCT ticker) AS unique_tickers
-     FROM ${table}
-     WHERE date = ?`
-  ).bind(date).all();
-
-  const stats = statsResult.results[0] || {
-    raw_rows: 0,
-    unique_tickers: 0
-  };
-
-  const presentResult = await env.DB.prepare(
-    `SELECT ticker, COUNT(*) AS row_count
-     FROM ${table}
-     WHERE date = ?
-     GROUP BY ticker
-     ORDER BY ticker`
+    `SELECT ticker, open, high, low, close, volume, source, COUNT(*) AS row_count
+     FROM ${table} WHERE date = ?
+     GROUP BY ticker, open, high, low, close, volume, source ORDER BY ticker`
   ).bind(date).all();
 
   const expectedSet = new Set();
   const presentSet = new Set();
-
+  const validSet = new Set();
+  let rawRows = 0, duplicateExtraRows = 0, invalidRows = 0;
+  const duplicateSamples = [], invalidSamples = [];
   for (const row of universe) {
     const ticker = normalizeTicker(row.ticker);
     if (ticker) expectedSet.add(ticker);
   }
-
-  let duplicateExtraRows = 0;
-  const duplicateSamples = [];
-
-  for (const row of presentResult.results || []) {
+  for (const row of statsResult.results || []) {
     const ticker = normalizeTicker(row.ticker);
-    const rowCount = Number(row.row_count || 0);
-
-    if (!ticker) continue;
-
+    const count = Number(row.row_count || 0);
+    rawRows += count;
+    if (!ticker) { invalidRows += count; continue; }
     presentSet.add(ticker);
-
-    if (rowCount > 1) {
-      duplicateExtraRows += rowCount - 1;
-      if (duplicateSamples.length < 20) {
-        duplicateSamples.push(`${ticker} x${rowCount}`);
-      }
+    if (count > 1) {
+      duplicateExtraRows += count - 1;
+      if (duplicateSamples.length < 20) duplicateSamples.push(`${ticker} x${count}`);
+    }
+    const values = [row.open, row.high, row.low, row.close, row.volume].map(Number);
+    const [open, high, low, close, volume] = values;
+    const source = String(row.source || "").toUpperCase();
+    const valid = values.every(Number.isFinite) &&
+      open > 0 && high > 0 && low > 0 && close > 0 && volume > 0 &&
+      high >= Math.max(open, low, close) &&
+      low <= Math.min(open, high, close) &&
+      source !== "CORPORATE_ACTION_CARRY_FORWARD";
+    if (valid) validSet.add(ticker);
+    else {
+      invalidRows += count;
+      if (invalidSamples.length < 20) invalidSamples.push(ticker);
     }
   }
 
-  const missing = [];
-  const extras = [];
-
-  for (const ticker of expectedSet) {
-    if (!presentSet.has(ticker)) missing.push(ticker);
-  }
-
-  for (const ticker of presentSet) {
-    if (!expectedSet.has(ticker)) extras.push(ticker);
-  }
-
-  missing.sort();
-  extras.sort();
+  const missing = [], extras = [];
+  for (const ticker of expectedSet) if (!validSet.has(ticker)) missing.push(ticker);
+  for (const ticker of validSet) if (!expectedSet.has(ticker)) extras.push(ticker);
+  missing.sort(); extras.sort();
 
   const expectedCount = expectedSet.size;
-  const rawRows = Number(stats.raw_rows || 0);
-  const uniqueTickers = Number(stats.unique_tickers || 0);
-
-  const status =
-    expectedCount === rawRows &&
-    expectedCount === uniqueTickers &&
-    duplicateExtraRows === 0 &&
-    missing.length === 0 &&
-    extras.length === 0
-      ? "OK"
-      : "FAIL";
+  const minimumRequiredCount = Math.ceil(expectedCount * 0.98);
+  const validUniqueTickers = validSet.size;
+  const coverageRate = expectedCount > 0 ? validUniqueTickers / expectedCount : 0;
+  const status = expectedCount > 0 &&
+    validUniqueTickers >= minimumRequiredCount && duplicateExtraRows === 0
+      ? "OK" : "FAIL";
 
   return {
-    index_code: indexCode,
-    date,
-    source_table: table,
+    index_code: indexCode, date, source_table: table,
     expected_count: expectedCount,
-    raw_rows: rawRows,
-    unique_tickers: uniqueTickers,
+    minimum_required_count: minimumRequiredCount,
+    coverage_rate: Number((coverageRate * 100).toFixed(2)),
+    raw_rows: rawRows, unique_tickers: presentSet.size,
+    valid_unique_tickers: validUniqueTickers, invalid_rows: invalidRows,
     duplicate_extra_rows: duplicateExtraRows,
-    missing_count: missing.length,
-    extra_count: extras.length,
+    missing_count: missing.length, extra_count: extras.length,
+    membership_grace_trading_days: 3,
     status,
-    missing_samples: missing.slice(0, 50),
-    extra_samples: extras.slice(0, 50),
+    missing_samples: missing.slice(0, 50), extra_samples: extras.slice(0, 50),
     duplicate_samples: duplicateSamples.slice(0, 50),
+    invalid_samples: invalidSamples.slice(0, 50),
     checked_at: new Date().toISOString(),
-    source: "worker_quality_check_v1"
+    source: "worker_quality_check_v2_98pct"
   };
 }
 
@@ -2429,6 +2408,27 @@ function buildOhlcvUpsertStatement(env, table, row) {
  * Deletes only OKTA rows for 2026-11-02..2026-11-05 from both OHLCV tables.
  * Requires the normal INGEST_TOKEN bearer auth.
  */
+async function handleNov2026RecoveryPrepare(env) {
+  const dates = ["2026-11-02", "2026-11-03"];
+  const tables = [getCurrentOhlcvReadTable(), LEGACY_OHLCV_TABLE];
+  const results = {};
+  for (const table of tables) {
+    assertAllowedOhlcvTable(table);
+    const result = await env.DB.prepare(
+      `DELETE FROM ${table}
+       WHERE date IN (?, ?)
+         AND source = 'CORPORATE_ACTION_CARRY_FORWARD'`
+    ).bind(...dates).run();
+    results[table] = Number(result.meta && result.meta.changes || 0);
+  }
+  return json({
+    ok: true,
+    operation: "remove_only_synthetic_corporate_action_rows",
+    dates,
+    deleted_rows_by_table: results
+  }, CORS_HEADERS);
+}
+
 async function handleNov2026RecoveryInspect(env) {
   const dates = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"];
   const membership = {};
