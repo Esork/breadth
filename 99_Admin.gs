@@ -33,7 +33,12 @@ function inspectOhlcvCacheDateAgainstCurrentRegistry(targetDate) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
   var registrySheet = getRegistrySheet_(ss);
-  var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
+  var universePayload = fetchNov2026CloudflareJson_(
+    '/api/universe?date=' + encodeURIComponent(dateKey)
+  );
+  var eligible = (universePayload.data || []).map(function(item) {
+    return normalizeTicker_(typeof item === 'string' ? item : item.ticker);
+  }).filter(Boolean);
   var eligibleMap = {};
   eligible.forEach(function(t) { eligibleMap[normalizeTicker_(t)] = true; });
   var lastRow = dbSheet.getLastRow();
@@ -349,6 +354,144 @@ function startNov2026OhlcvRecovery() {
   Logger.log('Recovery started. Tickers=' + state.tickers.length +
     ', dates=' + state.dates.join(', ') + '. Dedicated worker trigger installed.');
   return { started: true, tickerCount: state.tickers.length, dates: state.dates };
+}
+
+
+/**
+ * One-time corrective step after the first recovery attempt exposed the
+ * historical membership mismatch. Uses D1's date-specific universe as truth.
+ * Removes only OKTA cache/D1 rows for the four incident dates and upserts KVUE.
+ */
+function repairNov2026MembershipMismatch() {
+  var stateText = PropertiesService.getScriptProperties()
+    .getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_);
+  var state = parseJsonSafe_(stateText, null);
+  if (!state || state.status !== 'FAILED' || state.phase !== 'FINALIZE' ||
+      Number(state.dateCursor || 0) !== 0) {
+    throw new Error('Expected the existing FAILED recovery at FINALIZE dateCursor=0. No changes made.');
+  }
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var dbSheet = getDbSheet_(ss);
+  var bufferSheet = getBufferSheet_(ss);
+  var expectedByDate = {};
+  var kvueRows = [];
+
+  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
+    var universe = fetchNov2026CloudflareJson_(
+      '/api/universe?date=' + encodeURIComponent(dateKey)
+    );
+    var tickers = (universe.data || []).map(function(row) {
+      return normalizeTicker_(typeof row === 'string' ? row : row.ticker);
+    }).filter(Boolean);
+    var unique = {};
+    tickers.forEach(function(t) { unique[t] = true; });
+    if (Object.keys(unique).length !== 503 || !unique.KVUE || unique.OKTA) {
+      throw new Error('Unexpected authoritative D1 universe for ' + dateKey +
+        ': count=' + Object.keys(unique).length +
+        ', hasKVUE=' + !!unique.KVUE + ', hasOKTA=' + !!unique.OKTA);
+    }
+    expectedByDate[dateKey] = unique;
+  });
+
+  var bars = fetchGoogleFinanceBarsForRange_(
+    bufferSheet, 'KVUE',
+    NOV2026_OHLCV_RECOVERY_DATES_[0],
+    NOV2026_OHLCV_RECOVERY_DATES_[3]
+  );
+  var barsByDate = {};
+  bars.forEach(function(bar) { barsByDate[bar.dateKey] = bar; });
+  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
+    var bar = barsByDate[dateKey];
+    if (!bar) throw new Error('GoogleFinance returned no KVUE bar for ' + dateKey);
+    var row = ['KVUE', bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume];
+    if (!isValidNov2026OhlcvRow_(row)) {
+      throw new Error('Invalid KVUE OHLCV values for ' + dateKey);
+    }
+    kvueRows.push(normalizeOhlcvRowForCloudflare_(row, dateKey));
+  });
+
+  // Cloudflare cleanup is narrowly hard-coded to OKTA + four dates.
+  var cleanup = postNov2026RecoveryJson_(
+    '/admin/recovery/nov2026/remove-okta', {}
+  );
+  if (!cleanup || cleanup.ok !== true) {
+    throw new Error('Scoped D1 OKTA cleanup did not verify: ' + JSON.stringify(cleanup));
+  }
+
+  // Repair local cache by deleting only the four OKTA keys and upserting KVUE.
+  var lastRow = dbSheet.getLastRow();
+  var values = lastRow < 2 ? [] :
+    dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).getValues();
+  var rowsToKeep = [];
+  var removedOkta = 0;
+  var kvueExisting = {};
+  values.forEach(function(row) {
+    var ticker = normalizeTicker_(row[0]);
+    var dateKey = normalizeDateKey_(row[1]);
+    if (NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) >= 0 && ticker === 'OKTA') {
+      removedOkta++;
+      return;
+    }
+    if (ticker === 'KVUE' && NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) >= 0) {
+      kvueExisting[dateKey] = true;
+    }
+    rowsToKeep.push(row);
+  });
+  var rebuilt = rowsToKeep.slice();
+  kvueRows.forEach(function(row) {
+    if (!kvueExisting[row.date]) rebuilt.push([
+      row.ticker, row.date, row.open, row.high, row.low, row.close, row.volume
+    ]);
+  });
+  if (lastRow >= 2) dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).clearContent();
+  if (rebuilt.length) {
+    dbSheet.getRange(2, 1, rebuilt.length, OHLCV_HEADER.length).setValues(rebuilt);
+  }
+
+  // Re-ingest KVUE after cleanup; upsert is idempotent.
+  var ingest = postNov2026RecoveryJson_('/ingest/ohlcv', { data: kvueRows });
+  if (!ingest || ingest.ok === false || Number(ingest.accepted || ingest.valid || 0) !== 4) {
+    throw new Error('KVUE D1 ingest did not accept four rows: ' + JSON.stringify(ingest));
+  }
+
+  var verification = NOV2026_OHLCV_RECOVERY_DATES_.map(function(dateKey) {
+    var q = fetchNov2026CloudflareQuality_(dateKey);
+    if (q.status !== 'OK' || q.raw_rows !== 503 || q.unique_tickers !== 503 ||
+        q.missing_count !== 0 || q.extra_count !== 0 || q.duplicate_extra_rows !== 0) {
+      throw new Error('Quality still failing after membership repair for ' +
+        dateKey + ': ' + JSON.stringify(q));
+    }
+    return { date: dateKey, status: q.status, rawRows: q.raw_rows, expected: q.expected_count };
+  });
+
+  Logger.log(JSON.stringify({
+    ok: true,
+    localOktaRowsRemoved: removedOkta,
+    d1Cleanup: cleanup,
+    kvueRowsIngested: ingest.accepted || ingest.valid,
+    dates: verification,
+    next: 'Run resumeNov2026OhlcvRecovery() to derive the four dates.'
+  }, null, 2));
+  return { ok: true, dates: verification };
+}
+
+function postNov2026RecoveryJson_(path, payload) {
+  var response = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    payload: JSON.stringify(payload || {}),
+    headers: { Authorization: 'Bearer ' + getCloudflareIngestToken_() }
+  });
+  var code = response.getResponseCode();
+  var body = response.getContentText();
+  var parsed = parseJsonSafe_(body, null);
+  if (code < 200 || code >= 300 || !parsed || parsed.ok === false) {
+    throw new Error('Cloudflare recovery POST failed. Path=' + path +
+      ', HTTP=' + code + ', Body=' + body);
+  }
+  return parsed;
 }
 
 /** Dedicated trigger callback. Do not run production daily sync concurrently. */
