@@ -164,8 +164,14 @@ export default {
       if (path === "/ingest/membership" && request.method === "POST") {
         return handleIngestMembershipEvents(request, env);
       }
-      if (path === "/admin/recovery/nov2026/reconcile-membership" && request.method === "POST") {
-        return handleNov2026MembershipRecovery(env);
+      if (path === "/admin/recovery/nov2026/inspect" && request.method === "GET") {
+        return handleNov2026RecoveryInspect(env);
+      }
+      if ((path === "/admin/recovery/nov2026/reconcile-membership" || path === "/admin/recovery/nov2026/inspect") && request.method === "POST") {
+        return json({
+          ok: false,
+          error: "Disabled pending read-only reconciliation review. No changes made."
+        }, CORS_HEADERS, 409);
       }
       return json({
         ok: false,
@@ -2423,6 +2429,64 @@ function buildOhlcvUpsertStatement(env, table, row) {
  * Deletes only OKTA rows for 2026-11-02..2026-11-05 from both OHLCV tables.
  * Requires the normal INGEST_TOKEN bearer auth.
  */
+async function handleNov2026RecoveryInspect(env) {
+  const dates = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06"];
+  const membership = {};
+  for (const ticker of ["KVUE", "OKTA"]) {
+    const periods = await env.DB.prepare(
+      `SELECT index_code, ticker, start_date, end_date, event_type, source, notes
+       FROM index_membership_periods
+       WHERE index_code = ? AND ticker = ? ORDER BY start_date`
+    ).bind(INDEX_CODE, ticker).all();
+    membership[ticker] = periods.results || [];
+  }
+
+  const tickerRows = {};
+  for (const ticker of ["KVUE", "OKTA"]) {
+    const result = await env.DB.prepare(
+      `SELECT ticker, date_added, date_removed, is_current_sp500, is_active, source
+       FROM tickers WHERE ticker = ?`
+    ).bind(ticker).all();
+    tickerRows[ticker] = result.results || [];
+  }
+
+  const tables = [getCurrentOhlcvReadTable(), LEGACY_OHLCV_TABLE];
+  const ohlcv = {};
+  for (const table of tables) {
+    assertAllowedOhlcvTable(table);
+    ohlcv[table] = {};
+    for (const date of dates) {
+      const result = await env.DB.prepare(
+        `SELECT COUNT(*) AS rows,
+                SUM(CASE WHEN ticker = 'KVUE' THEN 1 ELSE 0 END) AS kvue,
+                SUM(CASE WHEN ticker = 'OKTA' THEN 1 ELSE 0 END) AS okta
+         FROM ${table} WHERE date = ?`
+      ).bind(date).all();
+      ohlcv[table][date] = result.results[0] || {};
+    }
+  }
+
+  const universes = {};
+  for (const date of dates) {
+    const rows = await getUniverseForDate(env, INDEX_CODE, date);
+    const symbols = new Set(rows.map((row) => normalizeTicker(row.ticker)));
+    universes[date] = {
+      count: rows.length,
+      has_kvue: symbols.has("KVUE"),
+      has_okta: symbols.has("OKTA")
+    };
+  }
+
+  return json({
+    ok: true,
+    read_only: true,
+    membership,
+    ticker_registry: tickerRows,
+    universes,
+    ohlcv
+  }, CORS_HEADERS);
+}
+
 async function handleNov2026MembershipRecovery(env) {
   const dates = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"];
   const preDates = ["2026-11-02", "2026-11-03"];
