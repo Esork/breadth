@@ -362,6 +362,16 @@ function startNov2026OhlcvRecovery() {
  * historical membership mismatch. Uses D1's date-specific universe as truth.
  * Removes only OKTA cache/D1 rows for the four incident dates and upserts KVUE.
  */
+/**
+ * Read-only diagnostic after a failed November 2026 membership repair.
+ * Does not mutate D1, Sheet cache, or recovery state.
+ */
+function inspectNov2026D1RecoveryState() {
+  var result = fetchNov2026CloudflareJson_('/admin/recovery/nov2026/inspect');
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
 function repairNov2026MembershipMismatch() {
   var stateText = PropertiesService.getScriptProperties()
     .getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_);
