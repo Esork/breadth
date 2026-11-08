@@ -371,77 +371,34 @@ function repairNov2026MembershipMismatch() {
     throw new Error('Expected the existing FAILED recovery at FINALIZE dateCursor=0. No changes made.');
   }
 
+  // KVUE ceased trading when the KMB acquisition closed on 2026-11-02.
+  // S&P DJI's replacement of KVUE with OKTA became effective before the
+  // 2026-11-04 open. The Worker endpoint applies this exact scoped correction:
+  // Nov 2-3: KVUE carry-forward at last traded close ($19.31), volume 0.
+  // Nov 4-5: OKTA remains; KVUE is no longer in the index universe.
+  var result = postNov2026RecoveryJson_(
+    '/admin/recovery/nov2026/reconcile-membership', {}
+  );
+  if (!result || result.ok !== true ||
+      result.operation !== 'nov2026_membership_and_ohlcv_reconciliation') {
+    throw new Error('Scoped membership reconciliation failed: ' + JSON.stringify(result));
+  }
+
+  // Verify the authoritative D1 quality result for all four incident dates.
+  var verification = NOV2026_OHLCV_RECOVERY_DATES_.map(function(dateKey) {
+    var q = fetchNov2026CloudflareQuality_(dateKey);
+    if (q.status !== 'OK' || q.raw_rows !== 503 || q.unique_tickers !== 503 ||
+        q.missing_count !== 0 || q.extra_count !== 0 || q.duplicate_extra_rows !== 0) {
+      throw new Error('Quality still failing after membership reconciliation for ' +
+        dateKey + ': ' + JSON.stringify(q));
+    }
+    return { date: dateKey, status: q.status, rawRows: q.raw_rows, expected: q.expected_count };
+  });
+
+  // Mirror the exact correction into the local Sheet cache only after D1
+  // membership and quality checks have passed.
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
-  var bufferSheet = getBufferSheet_(ss);
-  var expectedByDate = {};
-  var kvueRows = [];
-
-  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
-    var universe = fetchNov2026CloudflareJson_(
-      '/api/universe?date=' + encodeURIComponent(dateKey)
-    );
-    var tickers = (universe.data || []).map(function(row) {
-      return normalizeTicker_(typeof row === 'string' ? row : row.ticker);
-    }).filter(Boolean);
-    var unique = {};
-    tickers.forEach(function(t) { unique[t] = true; });
-    if (Object.keys(unique).length !== 503 || !unique.KVUE || unique.OKTA) {
-      throw new Error('Unexpected authoritative D1 universe for ' + dateKey +
-        ': count=' + Object.keys(unique).length +
-        ', hasKVUE=' + !!unique.KVUE + ', hasOKTA=' + !!unique.OKTA);
-    }
-    expectedByDate[dateKey] = unique;
-  });
-
-  // GoogleFinance has returned #N/A for KVUE, even with NYSE qualification.
-  // Try it first for consistency; fall back to Yahoo's chart endpoint only for
-  // this one-time incident repair. No destructive action occurs until all four
-  // dates have passed strict validation.
-  var bars = [];
-  var priceSource = 'GOOGLEFINANCE';
-  try {
-    bars = fetchGoogleFinanceBarsForRange_(
-      bufferSheet, 'KVUE',
-      NOV2026_OHLCV_RECOVERY_DATES_[0],
-      NOV2026_OHLCV_RECOVERY_DATES_[3]
-    );
-    if (bars.length !== NOV2026_OHLCV_RECOVERY_DATES_.length) {
-      throw new Error('GoogleFinance returned ' + bars.length + ' KVUE rows');
-    }
-  } catch (googleFinanceError) {
-    Logger.log('KVUE GoogleFinance unavailable; using Yahoo Finance fallback. ' +
-      String(googleFinanceError));
-    bars = fetchNov2026KvueBarsFromYahoo_(
-      NOV2026_OHLCV_RECOVERY_DATES_[0],
-      NOV2026_OHLCV_RECOVERY_DATES_[3]
-    );
-    priceSource = 'YAHOO_FINANCE';
-  }
-
-  var barsByDate = {};
-  bars.forEach(function(bar) { barsByDate[bar.dateKey] = bar; });
-  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
-    var bar = barsByDate[dateKey];
-    if (!bar) throw new Error(priceSource + ' returned no KVUE bar for ' + dateKey);
-    var row = ['KVUE', bar.date, bar.open, bar.high, bar.low, bar.close, bar.volume];
-    if (!isValidNov2026OhlcvRow_(row)) {
-      throw new Error('Invalid KVUE OHLCV values from ' + priceSource + ' for ' + dateKey);
-    }
-    var normalized = normalizeOhlcvRowForCloudflare_(row, dateKey);
-    normalized.source = priceSource;
-    kvueRows.push(normalized);
-  });
-
-  // Cloudflare cleanup is narrowly hard-coded to OKTA + four dates.
-  var cleanup = postNov2026RecoveryJson_(
-    '/admin/recovery/nov2026/remove-okta', {}
-  );
-  if (!cleanup || cleanup.ok !== true) {
-    throw new Error('Scoped D1 OKTA cleanup did not verify: ' + JSON.stringify(cleanup));
-  }
-
-  // Repair local cache by deleting only the four OKTA keys and upserting KVUE.
   var lastRow = dbSheet.getLastRow();
   var values = lastRow < 2 ? [] :
     dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).getValues();
@@ -450,128 +407,38 @@ function repairNov2026MembershipMismatch() {
   values.forEach(function(row, index) {
     var ticker = normalizeTicker_(row[0]);
     var dateKey = normalizeDateKey_(row[1]);
-    if (NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) < 0) return;
+    if (dateKey !== '2026-11-02' && dateKey !== '2026-11-03') return;
     if (ticker === 'OKTA') deleteRows.push(index + 2);
     if (ticker === 'KVUE') kvueExisting[dateKey] = true;
   });
-  deleteRows.sort(function(a, b) { return b - a; }).forEach(function(rowNumber) {
+  deleteRows.sort(function(x, y) { return y - x; }).forEach(function(rowNumber) {
     dbSheet.deleteRow(rowNumber);
   });
+
   var appendRows = [];
-  kvueRows.forEach(function(row) {
-    if (!kvueExisting[row.date]) appendRows.push([
-      row.ticker, row.date, row.open, row.high, row.low, row.close, row.volume
-    ]);
+  ['2026-11-02', '2026-11-03'].forEach(function(dateKey) {
+    if (!kvueExisting[dateKey]) {
+      appendRows.push([
+        'KVUE', new Date(dateKey + 'T12:00:00'), 19.31, 19.31, 19.31, 19.31, 0
+      ]);
+    }
   });
   if (appendRows.length) {
     dbSheet.getRange(dbSheet.getLastRow() + 1, 1, appendRows.length, OHLCV_HEADER.length)
       .setValues(appendRows);
   }
 
-  // Re-ingest KVUE after cleanup; upsert is idempotent.
-  var ingest = postNov2026RecoveryJson_('/ingest/ohlcv', { data: kvueRows });
-  if (!ingest || ingest.ok === false || Number(ingest.accepted || ingest.valid || ingest.received || 0) !== 4) {
-    throw new Error('KVUE D1 ingest did not accept four rows: ' + JSON.stringify(ingest));
-  }
-
-  var verification = NOV2026_OHLCV_RECOVERY_DATES_.map(function(dateKey) {
-    var q = fetchNov2026CloudflareQuality_(dateKey);
-    if (q.status !== 'OK' || q.raw_rows !== 503 || q.unique_tickers !== 503 ||
-        q.missing_count !== 0 || q.extra_count !== 0 || q.duplicate_extra_rows !== 0) {
-      throw new Error('Quality still failing after membership repair for ' +
-        dateKey + ': ' + JSON.stringify(q));
-    }
-    return { date: dateKey, status: q.status, rawRows: q.raw_rows, expected: q.expected_count };
-  });
-
   Logger.log(JSON.stringify({
     ok: true,
+    d1: result,
     localOktaRowsRemoved: deleteRows.length,
-    d1Cleanup: cleanup,
-    kvueRowsIngested: ingest.accepted || ingest.valid || ingest.received,
-    priceSource: priceSource,
+    localKvueRowsAdded: appendRows.length,
     dates: verification,
     next: 'Run resumeNov2026OhlcvRecovery() to derive the four dates.'
   }, null, 2));
   return { ok: true, dates: verification };
 }
 
-
-/**
- * Incident-only KVUE fallback using Yahoo Finance chart data.
- * Dates are mapped in America/New_York to avoid UTC/session-day drift.
- */
-function fetchNov2026KvueBarsFromYahoo_(startDateKey, endDateKey) {
-  var startParts = startDateKey.split('-').map(Number);
-  var endParts = endDateKey.split('-').map(Number);
-  var period1 = Math.floor(Date.UTC(startParts[0], startParts[1] - 1, startParts[2]) / 1000);
-  var period2 = Math.floor(Date.UTC(endParts[0], endParts[1] - 1, endParts[2] + 1) / 1000);
-  var url = 'https://query1.finance.yahoo.com/v8/finance/chart/KVUE' +
-    '?period1=' + period1 + '&period2=' + period2 + '&interval=1d&events=history';
-
-  var response = UrlFetchApp.fetch(url, {
-    method: 'get',
-    muteHttpExceptions: true,
-    headers: { 'User-Agent': 'Mozilla/5.0' }
-  });
-  var code = response.getResponseCode();
-  var body = response.getContentText();
-  if (code < 200 || code >= 300) {
-    throw new Error('Yahoo Finance HTTP ' + code + ': ' + body.slice(0, 500));
-  }
-
-  var payload = parseJsonSafe_(body, null);
-  var result = payload && payload.chart && payload.chart.result &&
-    payload.chart.result[0];
-  if (!result) {
-    var yahooError = payload && payload.chart && payload.chart.error;
-    throw new Error('Yahoo Finance returned no chart result: ' +
-      JSON.stringify(yahooError || payload).slice(0, 700));
-  }
-
-  var timestamps = result.timestamp || [];
-  var quote = result.indicators && result.indicators.quote &&
-    result.indicators.quote[0];
-  if (!quote) throw new Error('Yahoo Finance chart has no quote indicators.');
-
-  var rows = [];
-  for (var i = 0; i < timestamps.length; i++) {
-    var dateKey = Utilities.formatDate(
-      new Date(Number(timestamps[i]) * 1000),
-      'America/New_York',
-      'yyyy-MM-dd'
-    );
-    if (dateKey < startDateKey || dateKey > endDateKey) continue;
-
-    var open = quote.open && quote.open[i];
-    var high = quote.high && quote.high[i];
-    var low = quote.low && quote.low[i];
-    var close = quote.close && quote.close[i];
-    var volume = quote.volume && quote.volume[i];
-    if ([open, high, low, close, volume].some(function(v) {
-      return v === null || typeof v === 'undefined' || !isFinite(Number(v));
-    })) {
-      throw new Error('Yahoo Finance returned incomplete KVUE OHLCV for ' + dateKey);
-    }
-
-    rows.push({
-      date: new Date(dateKey + 'T12:00:00'),
-      dateKey: dateKey,
-      open: Number(open),
-      high: Number(high),
-      low: Number(low),
-      close: Number(close),
-      volume: Number(volume)
-    });
-  }
-
-  rows.sort(function(a, b) { return a.dateKey.localeCompare(b.dateKey); });
-  if (rows.length !== 4) {
-    throw new Error('Yahoo Finance returned ' + rows.length +
-      ' KVUE bars; expected exactly 4 for ' + startDateKey + ' through ' + endDateKey);
-  }
-  return rows;
-}
 
 function postNov2026RecoveryJson_(path, payload) {
   var response = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
