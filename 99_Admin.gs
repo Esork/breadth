@@ -384,15 +384,16 @@ function repairNov2026MembershipMismatch() {
     throw new Error('Scoped membership reconciliation failed: ' + JSON.stringify(result));
   }
 
-  // Verify the authoritative D1 quality result for all four incident dates.
-  var verification = NOV2026_OHLCV_RECOVERY_DATES_.map(function(dateKey) {
-    var q = fetchNov2026CloudflareQuality_(dateKey);
-    if (q.status !== 'OK' || q.raw_rows !== 503 || q.unique_tickers !== 503 ||
-        q.missing_count !== 0 || q.extra_count !== 0 || q.duplicate_extra_rows !== 0) {
-      throw new Error('Quality still failing after membership reconciliation for ' +
-        dateKey + ': ' + JSON.stringify(q));
+  // Do not require 503 D1 rows here: the original recovery stopped at
+  // the first date, so later dates are intentionally still empty. The
+  // FINALIZE worker will ingest and quality-check each date sequentially.
+  var membershipChecks = result.checks || {};
+  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
+    var check = membershipChecks[dateKey];
+    if (!check || check.universe_count !== 503) {
+      throw new Error('Membership reconciliation did not verify for ' + dateKey +
+        ': ' + JSON.stringify(check));
     }
-    return { date: dateKey, status: q.status, rawRows: q.raw_rows, expected: q.expected_count };
   });
 
   // Mirror the exact correction into the local Sheet cache only after D1
@@ -427,17 +428,6 @@ function repairNov2026MembershipMismatch() {
     dbSheet.getRange(dbSheet.getLastRow() + 1, 1, appendRows.length, OHLCV_HEADER.length)
       .setValues(appendRows);
   }
-
-  Logger.log(JSON.stringify({
-    ok: true,
-    d1: result,
-    localOktaRowsRemoved: deleteRows.length,
-    localKvueRowsAdded: appendRows.length,
-    dates: verification,
-    next: 'Run resumeNov2026OhlcvRecovery() to derive the four dates.'
-  }, null, 2));
-  return { ok: true, dates: verification };
-}
 
 
 function postNov2026RecoveryJson_(path, payload) {
@@ -976,14 +966,27 @@ function finalizeNov2026OhlcvRecovery_(state) {
   var dateKey = state.dates[dateIndex];
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
-  var registrySheet = getRegistrySheet_(ss);
   var cache = readNov2026CacheMap_(dbSheet);
-  var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
+
+  // D1's date-specific membership periods are authoritative. Do not use
+  // the stale local registry's historical membership calculation here.
+  var universePayload = fetchNov2026CloudflareJson_(
+    '/api/universe?date=' + encodeURIComponent(dateKey)
+  );
+  var eligible = (universePayload.data || []).map(function(row) {
+    return normalizeTicker_(typeof row === 'string' ? row : row.ticker);
+  }).filter(Boolean);
+  var unique = {};
+  eligible.forEach(function(ticker) { unique[ticker] = true; });
+  if (eligible.length !== 503 || Object.keys(unique).length !== 503) {
+    throw new Error('D1 authoritative universe is not 503 unique tickers for ' +
+      dateKey + ': rows=' + eligible.length + ', unique=' + Object.keys(unique).length);
+  }
+
   var rows = [];
   var missing = [];
-
   eligible.forEach(function(ticker) {
-    var record = cache[normalizeTicker_(ticker) + '|' + dateKey];
+    var record = cache[ticker + '|' + dateKey];
     if (!record || !isValidNov2026OhlcvRow_(record.row)) missing.push(ticker);
     else rows.push(normalizeOhlcvRowForCloudflare_(record.row, dateKey));
   });
@@ -1028,8 +1031,6 @@ function finalizeNov2026OhlcvRecovery_(state) {
     ', sectors=' + derive.derived.sector_breadth);
   return state.dateCursor >= state.dates.length;
 }
-
-
 
 function fetchNov2026CloudflareQuality_(dateKey) {
   var result = fetchNov2026CloudflareJson_('/api/quality/check?date=' + encodeURIComponent(dateKey));
