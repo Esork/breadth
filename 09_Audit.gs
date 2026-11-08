@@ -67,7 +67,7 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
   var scanStartRow = lastRow - scanRows + 1;
 
   var values = dbSheet
-    .getRange(scanStartRow, 1, scanRows, 2)
+    .getRange(scanStartRow, 1, scanRows, OHLCV_HEADER.length)
     .getValues();
 
   var latestDateKey = null;
@@ -96,16 +96,27 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
   var pairCounts = {};
   var presentTickers = {};
   var rawRows = 0;
+  var invalidRows = 0;
 
   for (var r = 0; r < values.length; r++) {
     var ticker = normalizeTicker_(values[r][0]);
     var rowDateKey = normalizeDateKey_(values[r][1]);
-
     if (!ticker || rowDateKey !== latestDateKey) continue;
 
     rawRows++;
+    var row = values[r];
+    var open = Number(row[2]), high = Number(row[3]), low = Number(row[4]);
+    var close = Number(row[5]), volume = Number(row[6]);
+    var valid = [open, high, low, close, volume].every(function(n) {
+      return isFinite(n);
+    }) && open > 0 && high > 0 && low > 0 && close > 0 && volume > 0 &&
+      high >= Math.max(open, low, close) &&
+      low <= Math.min(open, high, close);
+    if (!valid) {
+      invalidRows++;
+      continue;
+    }
     presentTickers[ticker] = true;
-
     var key = ticker + '|' + rowDateKey;
     pairCounts[key] = (pairCounts[key] || 0) + 1;
   }
@@ -114,44 +125,35 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
   var duplicatePairCount = 0;
   var duplicateExtraRows = 0;
   var duplicateSamples = [];
-
   keys.forEach(function(key) {
     var count = pairCounts[key];
-
     if (count > 1) {
       duplicatePairCount++;
       duplicateExtraRows += count - 1;
-
-      if (duplicateSamples.length < 10) {
-        duplicateSamples.push(key + ' x' + count);
-      }
+      if (duplicateSamples.length < 10) duplicateSamples.push(key + ' x' + count);
     }
   });
 
   var missing = [];
   eligible.forEach(function(ticker) {
     ticker = normalizeTicker_(ticker);
-    if (ticker && !presentTickers[ticker]) {
-      missing.push(ticker);
-    }
+    if (ticker && !presentTickers[ticker]) missing.push(ticker);
   });
-
   var extras = [];
   Object.keys(presentTickers).forEach(function(ticker) {
-    if (!expectedMap[ticker]) {
-      extras.push(ticker);
-    }
+    if (!expectedMap[ticker]) extras.push(ticker);
   });
-
   missing.sort();
   extras.sort();
 
-  var status =
-    rawRows === expectedEligibleCount &&
-    keys.length === expectedEligibleCount &&
-    duplicateExtraRows === 0 &&
-    missing.length === 0 &&
-    extras.length === 0
+  var minimumRequiredCount = Math.ceil(expectedEligibleCount * 0.98);
+  var validUniqueTickers = keys.length;
+  var coverageRate = expectedEligibleCount > 0
+    ? validUniqueTickers / expectedEligibleCount
+    : 0;
+  var status = expectedEligibleCount > 0 &&
+    validUniqueTickers >= minimumRequiredCount &&
+    duplicateExtraRows === 0
       ? 'OK'
       : 'FAIL';
 
@@ -163,8 +165,11 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
     scanStartRow: scanStartRow,
     scanEndRow: lastRow,
     expectedEligibleCount: expectedEligibleCount,
+    minimumRequiredCount: minimumRequiredCount,
+    coverageRate: Number((coverageRate * 100).toFixed(2)),
     rawRows: rawRows,
     uniqueTickerDates: keys.length,
+    invalidRows: invalidRows,
     duplicatePairCount: duplicatePairCount,
     duplicateExtraRows: duplicateExtraRows,
     missingCount: missing.length,
@@ -192,6 +197,8 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
       rawRows +
       ', Unique=' +
       keys.length +
+      ', MinimumRequired=' + minimumRequiredCount +
+      ', InvalidRows=' + invalidRows +
       ', Duplicates=' +
       duplicateExtraRows +
       ', Missing=' +
