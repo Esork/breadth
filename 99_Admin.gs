@@ -367,7 +367,8 @@ function startNov2026OhlcvRecovery() {
  * Does not mutate D1, Sheet cache, or recovery state.
  */
 function inspectNov2026D1RecoveryState() {
-  var result = fetchNov2026CloudflareJson_('/admin/recovery/nov2026/inspect');
+  // This diagnostic route is protected by the Worker INGEST_TOKEN.
+  var result = fetchNov2026CloudflareJson_('/admin/recovery/nov2026/inspect', true);
   Logger.log(JSON.stringify(result, null, 2));
   return result;
 }
@@ -1064,11 +1065,15 @@ function fetchNov2026CloudflareQuality_(dateKey) {
   return result.quality;
 }
 
-function fetchNov2026CloudflareJson_(path) {
-  var response = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
+function fetchNov2026CloudflareJson_(path, requireAuth) {
+  var options = {
     method: 'get',
     muteHttpExceptions: true
-  });
+  };
+  if (requireAuth) {
+    options.headers = { Authorization: 'Bearer ' + getCloudflareIngestToken_() };
+  }
+  var response = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, options);
   var code = response.getResponseCode();
   var body = response.getContentText();
   var parsed = parseJsonSafe_(body, null);
