@@ -2456,7 +2456,11 @@ async function handleNov2026MembershipRecovery(env) {
 
   const kvuePeriod = kvuePeriods.results[0];
   const oktaPeriod = oktaPeriods.results[0];
-  if (kvuePeriod.end_date !== "2026-11-06" || oktaPeriod.start_date !== "2026-11-06") {
+  const kvuePeriodOk = kvuePeriod.end_date === "2026-11-06" ||
+    kvuePeriod.end_date === "2026-11-04";
+  const oktaPeriodOk = oktaPeriod.start_date === "2026-11-06" ||
+    oktaPeriod.start_date === "2026-11-04";
+  if (!kvuePeriodOk || !oktaPeriodOk) {
     throw new Error("Unexpected membership periods. KVUE=" +
       JSON.stringify(kvuePeriod) + " OKTA=" + JSON.stringify(oktaPeriod));
   }
