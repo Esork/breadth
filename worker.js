@@ -164,8 +164,8 @@ export default {
       if (path === "/ingest/membership" && request.method === "POST") {
         return handleIngestMembershipEvents(request, env);
       }
-      if (path === "/admin/recovery/nov2026/remove-okta" && request.method === "POST") {
-        return handleNov2026RemoveOktaRecoveryRows(env);
+      if (path === "/admin/recovery/nov2026/reconcile-membership" && request.method === "POST") {
+        return handleNov2026MembershipRecovery(env);
       }
       return json({
         ok: false,
@@ -2423,50 +2423,128 @@ function buildOhlcvUpsertStatement(env, table, row) {
  * Deletes only OKTA rows for 2026-11-02..2026-11-05 from both OHLCV tables.
  * Requires the normal INGEST_TOKEN bearer auth.
  */
-async function handleNov2026RemoveOktaRecoveryRows(env) {
+async function handleNov2026MembershipRecovery(env) {
   const dates = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"];
+  const preDates = ["2026-11-02", "2026-11-03"];
   const tables = [getCurrentOhlcvReadTable(), LEGACY_OHLCV_TABLE];
-  const before = {};
-  const statements = [];
+
+  // S&P DJI announced OKTA replaces KVUE effective before the Nov 4 open.
+  // KVUE stopped trading at the Nov 2 open after KMB completed the acquisition.
+  // Carry forward its last traded close (Oct 30: $19.31) with zero volume only
+  // for Nov 2-3; do not fabricate trading bars after its index removal.
+  const kvueClose = 19.31;
+  const kvueRows = preDates.map((date) => ({
+    ticker: "KVUE", date, open: kvueClose, high: kvueClose,
+    low: kvueClose, close: kvueClose, volume: 0,
+    source: "CORPORATE_ACTION_CARRY_FORWARD",
+    ingested_at: new Date().toISOString()
+  }));
+
+  const kvuePeriods = await env.DB.prepare(
+    `SELECT start_date, end_date FROM index_membership_periods
+     WHERE index_code = ? AND ticker = ?`
+  ).bind(INDEX_CODE, "KVUE").all();
+  const oktaPeriods = await env.DB.prepare(
+    `SELECT start_date, end_date FROM index_membership_periods
+     WHERE index_code = ? AND ticker = ?`
+  ).bind(INDEX_CODE, "OKTA").all();
+
+  if (!kvuePeriods.results || kvuePeriods.results.length !== 1 ||
+      !oktaPeriods.results || oktaPeriods.results.length !== 1) {
+    throw new Error("Expected exactly one KVUE and one OKTA membership period; refusing repair.");
+  }
+
+  const kvuePeriod = kvuePeriods.results[0];
+  const oktaPeriod = oktaPeriods.results[0];
+  if (kvuePeriod.end_date !== "2026-11-06" || oktaPeriod.start_date !== "2026-11-06") {
+    throw new Error("Unexpected membership periods. KVUE=" +
+      JSON.stringify(kvuePeriod) + " OKTA=" + JSON.stringify(oktaPeriod));
+  }
+
+  const statements = [
+    env.DB.prepare(
+      `UPDATE index_membership_periods
+       SET end_date = '2026-11-04', event_type = 'REMOVE',
+           source = 'S&P DJI constituent change 2026-11-04',
+           notes = 'KVUE acquired by KMB; ceased trading 2026-11-02; S&P removal effective before 2026-11-04 open',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE index_code = ? AND ticker = ? AND end_date = '2026-11-06'`
+    ).bind(INDEX_CODE, "KVUE"),
+    env.DB.prepare(
+      `UPDATE index_membership_periods
+       SET start_date = '2026-11-04', event_type = 'ADD',
+           source = 'S&P DJI constituent change 2026-11-04',
+           notes = 'OKTA replaces KVUE effective before 2026-11-04 open',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE index_code = ? AND ticker = ? AND start_date = '2026-11-06'`
+    ).bind(INDEX_CODE, "OKTA"),
+    env.DB.prepare(
+      `UPDATE tickers SET date_removed = '2026-11-04', is_current_sp500 = 0,
+       updated_at = CURRENT_TIMESTAMP WHERE ticker = 'KVUE'`
+    ),
+    env.DB.prepare(
+      `UPDATE tickers SET date_added = '2026-11-04', is_current_sp500 = 1,
+       updated_at = CURRENT_TIMESTAMP WHERE ticker = 'OKTA'`
+    )
+  ];
 
   for (const table of tables) {
     assertAllowedOhlcvTable(table);
-    before[table] = {};
-    for (const date of dates) {
-      const count = await env.DB.prepare(
-        `SELECT COUNT(*) AS n FROM ${table} WHERE ticker = ? AND date = ?`
-      ).bind("OKTA", date).all();
-      before[table][date] = Number(count.results[0] && count.results[0].n || 0);
-      statements.push(env.DB.prepare(
-        `DELETE FROM ${table} WHERE ticker = ? AND date = ?`
-      ).bind("OKTA", date));
+    for (const date of preDates) {
+      statements.push(
+        env.DB.prepare(`DELETE FROM ${table} WHERE ticker = 'OKTA' AND date = ?`).bind(date)
+      );
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO ${table} (
+            ticker, date, open, high, low, close, volume, source, ingested_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(ticker, date) DO UPDATE SET
+            open=excluded.open, high=excluded.high, low=excluded.low,
+            close=excluded.close, volume=excluded.volume,
+            source=excluded.source, ingested_at=excluded.ingested_at`
+        ).bind("KVUE", date, kvueClose, kvueClose, kvueClose, kvueClose, 0,
+          "CORPORATE_ACTION_CARRY_FORWARD", new Date().toISOString())
+      );
     }
   }
 
-  const results = await env.DB.batch(statements);
-  const after = {};
-  for (const table of tables) {
-    after[table] = {};
-    for (const date of dates) {
-      const count = await env.DB.prepare(
-        `SELECT COUNT(*) AS n FROM ${table} WHERE ticker = ? AND date = ?`
-      ).bind("OKTA", date).all();
-      after[table][date] = Number(count.results[0] && count.results[0].n || 0);
+  await env.DB.batch(statements);
+
+  // Verify membership and raw rows on both sides of the Nov 4 effective date.
+  const checks = {};
+  for (const date of dates) {
+    const universe = await getUniverseForDate(env, INDEX_CODE, date);
+    const symbols = new Set(universe.map((row) => normalizeTicker(row.ticker)));
+    const shouldHaveKvue = date < "2026-11-04";
+    if (universe.length !== 503 ||
+        symbols.has("KVUE") !== shouldHaveKvue ||
+        symbols.has("OKTA") === shouldHaveKvue) {
+      throw new Error("Membership verification failed for " + date +
+        ": count=" + universe.length + ", KVUE=" + symbols.has("KVUE") +
+        ", OKTA=" + symbols.has("OKTA"));
     }
+
+    const raw = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM ${getCurrentOhlcvReadTable()} WHERE date = ?`
+    ).bind(date).all();
+    checks[date] = {
+      universe_count: universe.length,
+      kvue_in_universe: symbols.has("KVUE"),
+      okta_in_universe: symbols.has("OKTA"),
+      raw_rows: Number(raw.results[0] && raw.results[0].n || 0)
+    };
   }
 
-  const remaining = Object.values(after).some((byDate) =>
-    Object.values(byDate).some((n) => n !== 0)
-  );
   return json({
-    ok: !remaining,
-    operation: "nov2026_scoped_okta_cleanup",
-    deleted_rows_reported: results.reduce((sum, item) =>
-      sum + Number(item && item.meta && (item.meta.changes || item.meta.rows_written) || 0), 0),
-    before,
-    after,
-    scope: { ticker: "OKTA", dates, tables }
-  }, CORS_HEADERS, remaining ? 500 : 200);
+    ok: true,
+    operation: "nov2026_membership_and_ohlcv_reconciliation",
+    effective_date: "2026-11-04",
+    kvue_carry_forward_dates: preDates,
+    kvue_carry_forward_close: kvueClose,
+    kvue_volume: 0,
+    checks
+  }, CORS_HEADERS);
 }
 
 function getCurrentOhlcvReadTable() {
