@@ -448,6 +448,51 @@ function resumeNov2026OhlcvRecovery() {
 }
 
 /** Read-only post-run verification. Requires recovery to have completed. */
+/**
+ * Read-only diagnostic: compare the Apps Script historical universe with D1's
+ * authoritative date-specific universe before any further recovery writes.
+ */
+function inspectNov2026MembershipMismatch() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var registrySheet = getRegistrySheet_(ss);
+  var reports = [];
+
+  NOV2026_OHLCV_RECOVERY_DATES_.forEach(function(dateKey) {
+    var local = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey)
+      .map(normalizeTicker_).filter(Boolean).sort();
+    var remotePayload = fetchNov2026CloudflareJson_(
+      '/api/universe?date=' + encodeURIComponent(dateKey)
+    );
+    var remoteRows = remotePayload.data || [];
+    var remote = remoteRows.map(function(row) {
+      return normalizeTicker_(typeof row === 'string' ? row : row.ticker);
+    }).filter(Boolean).sort();
+
+    var localSet = {};
+    var remoteSet = {};
+    local.forEach(function(t) { localSet[t] = true; });
+    remote.forEach(function(t) { remoteSet[t] = true; });
+
+    reports.push({
+      date: dateKey,
+      localCount: local.length,
+      d1Count: remote.length,
+      localOnly: local.filter(function(t) { return !remoteSet[t]; }),
+      d1Only: remote.filter(function(t) { return !localSet[t]; })
+    });
+  });
+
+  var output = {
+    readOnly: true,
+    activeRecoveryState: parseJsonSafe_(
+      PropertiesService.getScriptProperties().getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_), null
+    ),
+    reports: reports
+  };
+  Logger.log(JSON.stringify(output, null, 2));
+  return output;
+}
+
 function verifyNov2026OhlcvRecovery() {
   var props = PropertiesService.getScriptProperties();
   var active = props.getProperty(NOV2026_OHLCV_RECOVERY_STATE_KEY_);
