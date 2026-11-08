@@ -423,30 +423,27 @@ function repairNov2026MembershipMismatch() {
   var lastRow = dbSheet.getLastRow();
   var values = lastRow < 2 ? [] :
     dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).getValues();
-  var rowsToKeep = [];
-  var removedOkta = 0;
+  var deleteRows = [];
   var kvueExisting = {};
-  values.forEach(function(row) {
+  values.forEach(function(row, index) {
     var ticker = normalizeTicker_(row[0]);
     var dateKey = normalizeDateKey_(row[1]);
-    if (NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) >= 0 && ticker === 'OKTA') {
-      removedOkta++;
-      return;
-    }
-    if (ticker === 'KVUE' && NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) >= 0) {
-      kvueExisting[dateKey] = true;
-    }
-    rowsToKeep.push(row);
+    if (NOV2026_OHLCV_RECOVERY_DATES_.indexOf(dateKey) < 0) return;
+    if (ticker === 'OKTA') deleteRows.push(index + 2);
+    if (ticker === 'KVUE') kvueExisting[dateKey] = true;
   });
-  var rebuilt = rowsToKeep.slice();
+  deleteRows.sort(function(a, b) { return b - a; }).forEach(function(rowNumber) {
+    dbSheet.deleteRow(rowNumber);
+  });
+  var appendRows = [];
   kvueRows.forEach(function(row) {
-    if (!kvueExisting[row.date]) rebuilt.push([
+    if (!kvueExisting[row.date]) appendRows.push([
       row.ticker, row.date, row.open, row.high, row.low, row.close, row.volume
     ]);
   });
-  if (lastRow >= 2) dbSheet.getRange(2, 1, lastRow - 1, OHLCV_HEADER.length).clearContent();
-  if (rebuilt.length) {
-    dbSheet.getRange(2, 1, rebuilt.length, OHLCV_HEADER.length).setValues(rebuilt);
+  if (appendRows.length) {
+    dbSheet.getRange(dbSheet.getLastRow() + 1, 1, appendRows.length, OHLCV_HEADER.length)
+      .setValues(appendRows);
   }
 
   // Re-ingest KVUE after cleanup; upsert is idempotent.
@@ -467,7 +464,7 @@ function repairNov2026MembershipMismatch() {
 
   Logger.log(JSON.stringify({
     ok: true,
-    localOktaRowsRemoved: removedOkta,
+    localOktaRowsRemoved: deleteRows.length,
     d1Cleanup: cleanup,
     kvueRowsIngested: ingest.accepted || ingest.valid,
     dates: verification,
