@@ -185,7 +185,8 @@ export default {
 function requiresWriteAuth(path) {
   return (
     path.startsWith("/ingest/") ||
-    path.startsWith("/jobs/")
+    path.startsWith("/jobs/") ||
+    path === "/admin/recovery/nov2026/remove-okta"
   );
 }
 
