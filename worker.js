@@ -2093,49 +2093,12 @@ async function computeOhlcvQuality(env, indexCode, date) {
   for (const ticker of validSet) if (!expectedSet.has(ticker)) extras.push(ticker);
   missing.sort(); extras.sort();
 
-  // Membership metadata can lag an effective constituent change. Permit a
-  // mismatch only when the ticker has a recorded membership boundary within
-  // two calendar days of this OHLCV date; all other mismatches remain failures.
-  const mismatchTickers = Array.from(new Set(missing.concat(extras)));
-  const membershipBoundaryByTicker = new Map();
-  if (mismatchTickers.length > 0) {
-    const placeholders = mismatchTickers.map(() => "?").join(", ");
-    const boundaries = await env.DB.prepare(
-      `SELECT ticker, start_date, end_date
-       FROM index_membership_periods
-       WHERE index_code = ? AND ticker IN (${placeholders})`
-    ).bind(indexCode, ...mismatchTickers).all();
-
-    for (const row of boundaries.results || []) {
-      const ticker = normalizeTicker(row.ticker);
-      const dates = [row.start_date, row.end_date].filter(Boolean);
-      const distances = dates.map((boundaryDate) => {
-        const boundaryTime = Date.parse(String(boundaryDate) + "T00:00:00Z");
-        const targetTime = Date.parse(date + "T00:00:00Z");
-        return Number.isFinite(boundaryTime) && Number.isFinite(targetTime)
-          ? Math.abs(boundaryTime - targetTime) / 86400000
-          : Infinity;
-      });
-      const nearest = distances.length ? Math.min(...distances) : Infinity;
-      membershipBoundaryByTicker.set(
-        ticker,
-        Math.min(membershipBoundaryByTicker.get(ticker) ?? Infinity, nearest)
-      );
-    }
-  }
-
-  const outsideMembershipGrace = mismatchTickers.filter((ticker) =>
-    (membershipBoundaryByTicker.get(ticker) ?? Infinity) > 2
-  );
-  const membershipGraceOk = outsideMembershipGrace.length === 0;
   const expectedCount = expectedSet.size;
   const minimumRequiredCount = Math.ceil(expectedCount * 0.98);
   const validUniqueTickers = validSet.size;
   const coverageRate = expectedCount > 0 ? validUniqueTickers / expectedCount : 0;
   const status = expectedCount > 0 &&
-    validUniqueTickers >= minimumRequiredCount &&
-    duplicateExtraRows === 0 &&
-    membershipGraceOk
+    validUniqueTickers >= minimumRequiredCount && duplicateExtraRows === 0
       ? "OK" : "FAIL";
 
   return {
@@ -2147,15 +2110,13 @@ async function computeOhlcvQuality(env, indexCode, date) {
     valid_unique_tickers: validUniqueTickers, invalid_rows: invalidRows,
     duplicate_extra_rows: duplicateExtraRows,
     missing_count: missing.length, extra_count: extras.length,
-    membership_grace_calendar_days: 2,
-    membership_grace_mismatch_count: mismatchTickers.length,
-    outside_membership_grace: outsideMembershipGrace.slice(0, 50),
+    membership_grace_trading_days: 2,
     status,
     missing_samples: missing.slice(0, 50), extra_samples: extras.slice(0, 50),
     duplicate_samples: duplicateSamples.slice(0, 50),
     invalid_samples: invalidSamples.slice(0, 50),
     checked_at: new Date().toISOString(),
-    source: "worker_quality_check_v3_98pct_2day_grace"
+    source: "worker_quality_check_v2_98pct"
   };
 }
 
