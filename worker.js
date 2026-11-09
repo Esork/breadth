@@ -2073,8 +2073,7 @@ async function computeOhlcvQuality(env, indexCode, date) {
     const valid = values.every(Number.isFinite) &&
       open > 0 && high > 0 && low > 0 && close > 0 && volume > 0 &&
       high >= Math.max(open, low, close) &&
-      low <= Math.min(open, high, close) &&
-      true;
+      low <= Math.min(open, high, close);
     if (valid) validSet.add(ticker);
     else {
       invalidRows++;
