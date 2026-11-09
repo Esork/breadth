@@ -15,7 +15,6 @@ var DAILY_LAST_HEALTH_PROP_KEY = 'QE_DAILY_LAST_HEALTH_V1';
 function startDailySyncNow() {
   var startTime = Date.now();
   var module = SYS_CONFIG.DAILY_SYNC.LOG_MODULE;
-
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
   var registrySheet = getRegistrySheet_(ss);
