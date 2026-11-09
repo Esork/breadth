@@ -2100,7 +2100,8 @@ async function computeOhlcvQuality(env, indexCode, date) {
   const matchedExpectedTickers = expectedCount - missing.length;
   const coverageRate = expectedCount > 0 ? matchedExpectedTickers / expectedCount : 0;
   const status = expectedCount > 0 &&
-    matchedExpectedTickers >= minimumRequiredCount && duplicateExtraRows === 0
+    matchedExpectedTickers >= minimumRequiredCount &&
+    duplicateExtraRows === 0 && invalidRows === 0
       ? "OK" : "FAIL";
 
   return {
