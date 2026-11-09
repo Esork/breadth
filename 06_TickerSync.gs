@@ -15,7 +15,6 @@ function syncSP500TickersList() {
 function syncSP500TickerRegistry() {
   var startTime = Date.now();
   var module = SYS_CONFIG.TICKER_SYNC.LOG_MODULE;
-
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var registrySheet = getRegistrySheet_(ss);
 
