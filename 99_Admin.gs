@@ -32,8 +32,17 @@ function inspectOhlcvCacheDateAgainstCurrentRegistry(targetDate) {
   if (!dateKey) throw new Error('Pass targetDate as YYYY-MM-DD.');
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var dbSheet = getDbSheet_(ss);
-  var registrySheet = getRegistrySheet_(ss);
-  var eligible = readEligibleTickerListForOhlcvDate_(registrySheet, dateKey);
+  var universePayload = fetchCloudflareJsonForAdmin_(
+    '/api/universe?date=' + encodeURIComponent(dateKey)
+  );
+  if (!universePayload || universePayload.ok !== true ||
+      !Array.isArray(universePayload.data)) {
+    throw new Error('Cloudflare returned an invalid date-specific universe: ' +
+      JSON.stringify(universePayload));
+  }
+  var eligible = universePayload.data.map(function(item) {
+    return normalizeTicker_(typeof item === 'string' ? item : item.ticker);
+  }).filter(Boolean);
   var eligibleMap = {};
   eligible.forEach(function(t) { eligibleMap[normalizeTicker_(t)] = true; });
   var lastRow = dbSheet.getLastRow();
@@ -274,3 +283,17 @@ function continueBackfillOHLCV() { stopLegacyWorkerTrigger_('continueBackfillOHL
 function continueDailyIncrementalSync() { stopLegacyWorkerTrigger_('continueDailyIncrementalSync'); }
 function cloudflareHistoricalOhlcvWorker() { stopLegacyWorkerTrigger_('cloudflareHistoricalOhlcvWorker'); }
 function cloudflareOhlcvSyncWorker() { stopLegacyWorkerTrigger_('cloudflareOhlcvSyncWorker'); }
+
+function fetchCloudflareJsonForAdmin_(path) {
+  var response = UrlFetchApp.fetch(SYS_CONFIG.CLOUDFLARE.BASE_URL + path, {
+    method: 'get', muteHttpExceptions: true
+  });
+  var code = response.getResponseCode();
+  var body = response.getContentText();
+  var parsed = parseJsonSafe_(body, null);
+  if (code < 200 || code >= 300 || !parsed) {
+    throw new Error('Cloudflare GET failed. Path=' + path +
+      ', HTTP=' + code + ', Body=' + body);
+  }
+  return parsed;
+}

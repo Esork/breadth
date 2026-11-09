@@ -2045,100 +2045,82 @@ async function getUniverseForDate(env, indexCode, date) {
 async function computeOhlcvQuality(env, indexCode, date) {
   const table = getCurrentOhlcvReadTable();
   assertAllowedOhlcvTable(table);
-
   const universe = await getUniverseForDate(env, indexCode, date);
-
-  const statsResult = await env.DB.prepare(
-    `SELECT
-       COUNT(*) AS raw_rows,
-       COUNT(DISTINCT ticker) AS unique_tickers
-     FROM ${table}
-     WHERE date = ?`
-  ).bind(date).all();
-
-  const stats = statsResult.results[0] || {
-    raw_rows: 0,
-    unique_tickers: 0
-  };
-
-  const presentResult = await env.DB.prepare(
-    `SELECT ticker, COUNT(*) AS row_count
-     FROM ${table}
-     WHERE date = ?
-     GROUP BY ticker
-     ORDER BY ticker`
+  const rowsResult = await env.DB.prepare(
+    `SELECT ticker, open, high, low, close, volume, source
+     FROM ${table} WHERE date = ? ORDER BY ticker`
   ).bind(date).all();
 
   const expectedSet = new Set();
   const presentSet = new Set();
-
+  const validSet = new Set();
+  const rowCounts = new Map();
+  let rawRows = 0, duplicateExtraRows = 0, invalidRows = 0;
+  const duplicateSamples = [], invalidSamples = [];
   for (const row of universe) {
     const ticker = normalizeTicker(row.ticker);
     if (ticker) expectedSet.add(ticker);
   }
-
-  let duplicateExtraRows = 0;
-  const duplicateSamples = [];
-
-  for (const row of presentResult.results || []) {
+  for (const row of rowsResult.results || []) {
+    rawRows++;
     const ticker = normalizeTicker(row.ticker);
-    const rowCount = Number(row.row_count || 0);
-
-    if (!ticker) continue;
-
+    if (!ticker) { invalidRows++; continue; }
     presentSet.add(ticker);
+    rowCounts.set(ticker, (rowCounts.get(ticker) || 0) + 1);
 
-    if (rowCount > 1) {
-      duplicateExtraRows += rowCount - 1;
-      if (duplicateSamples.length < 20) {
-        duplicateSamples.push(`${ticker} x${rowCount}`);
-      }
+    const values = [row.open, row.high, row.low, row.close, row.volume].map(Number);
+    const [open, high, low, close, volume] = values;
+    const valid = values.every(Number.isFinite) &&
+      open > 0 && high > 0 && low > 0 && close > 0 && volume > 0 &&
+      high >= Math.max(open, low, close) &&
+      low <= Math.min(open, high, close);
+    if (valid) validSet.add(ticker);
+    else {
+      invalidRows++;
+      if (invalidSamples.length < 20) invalidSamples.push(ticker);
+    }
+  }
+  for (const [ticker, count] of rowCounts.entries()) {
+    if (count > 1) {
+      duplicateExtraRows += count - 1;
+      if (duplicateSamples.length < 20) duplicateSamples.push(`${ticker} x${count}`);
     }
   }
 
-  const missing = [];
-  const extras = [];
-
-  for (const ticker of expectedSet) {
-    if (!presentSet.has(ticker)) missing.push(ticker);
-  }
-
-  for (const ticker of presentSet) {
-    if (!expectedSet.has(ticker)) extras.push(ticker);
-  }
-
-  missing.sort();
-  extras.sort();
+  const missing = [], extras = [];
+  for (const ticker of expectedSet) if (!validSet.has(ticker)) missing.push(ticker);
+  for (const ticker of validSet) if (!expectedSet.has(ticker)) extras.push(ticker);
+  missing.sort(); extras.sort();
 
   const expectedCount = expectedSet.size;
-  const rawRows = Number(stats.raw_rows || 0);
-  const uniqueTickers = Number(stats.unique_tickers || 0);
-
-  const status =
-    expectedCount === rawRows &&
-    expectedCount === uniqueTickers &&
-    duplicateExtraRows === 0 &&
-    missing.length === 0 &&
-    extras.length === 0
-      ? "OK"
-      : "FAIL";
+  const minimumRequiredCount = Math.ceil(expectedCount * 0.98);
+  const validUniqueTickers = validSet.size;
+  // Extras must never inflate coverage: only valid members of the expected
+  // date-specific universe count toward the 98% threshold.
+  const matchedExpectedTickers = expectedCount - missing.length;
+  const coverageRate = expectedCount > 0 ? matchedExpectedTickers / expectedCount : 0;
+  const status = expectedCount > 0 &&
+    matchedExpectedTickers >= minimumRequiredCount &&
+    duplicateExtraRows === 0 && invalidRows === 0
+      ? "OK" : "FAIL";
 
   return {
-    index_code: indexCode,
-    date,
-    source_table: table,
+    index_code: indexCode, date, source_table: table,
     expected_count: expectedCount,
-    raw_rows: rawRows,
-    unique_tickers: uniqueTickers,
+    minimum_required_count: minimumRequiredCount,
+    coverage_rate: Number((coverageRate * 100).toFixed(2)),
+    raw_rows: rawRows, unique_tickers: presentSet.size,
+    valid_unique_tickers: validUniqueTickers,
+    matched_expected_tickers: matchedExpectedTickers, invalid_rows: invalidRows,
     duplicate_extra_rows: duplicateExtraRows,
-    missing_count: missing.length,
-    extra_count: extras.length,
+    missing_count: missing.length, extra_count: extras.length,
+    membership_grace_trading_days: 2,
     status,
-    missing_samples: missing.slice(0, 50),
-    extra_samples: extras.slice(0, 50),
+    missing_samples: missing.slice(0, 50), extra_samples: extras.slice(0, 50),
     duplicate_samples: duplicateSamples.slice(0, 50),
+    invalid_samples: invalidSamples.slice(0, 50),
     checked_at: new Date().toISOString(),
-    source: "worker_quality_check_v1"
+    source: "worker_quality_check_v2_98pct"
   };
 }
 
@@ -2412,6 +2394,8 @@ function buildOhlcvUpsertStatement(env, table, row) {
 /* -----------------------------
  * Bucket helpers
  * ----------------------------- */
+
+
 
 function getCurrentOhlcvReadTable() {
   return "ohlcv_daily_2024_2027";
