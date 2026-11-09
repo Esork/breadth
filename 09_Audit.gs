@@ -155,7 +155,8 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
     : 0;
   var status = expectedEligibleCount > 0 &&
     matchedExpectedTickers >= minimumRequiredCount &&
-    duplicateExtraRows === 0
+    duplicateExtraRows === 0 &&
+    invalidRows === 0
       ? 'OK'
       : 'FAIL';
 
