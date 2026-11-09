@@ -2095,9 +2095,12 @@ async function computeOhlcvQuality(env, indexCode, date) {
   const expectedCount = expectedSet.size;
   const minimumRequiredCount = Math.ceil(expectedCount * 0.98);
   const validUniqueTickers = validSet.size;
-  const coverageRate = expectedCount > 0 ? validUniqueTickers / expectedCount : 0;
+  // Extras must never inflate coverage: only valid members of the expected
+  // date-specific universe count toward the 98% threshold.
+  const matchedExpectedTickers = expectedCount - missing.length;
+  const coverageRate = expectedCount > 0 ? matchedExpectedTickers / expectedCount : 0;
   const status = expectedCount > 0 &&
-    validUniqueTickers >= minimumRequiredCount && duplicateExtraRows === 0
+    matchedExpectedTickers >= minimumRequiredCount && duplicateExtraRows === 0
       ? "OK" : "FAIL";
 
   return {
@@ -2106,7 +2109,8 @@ async function computeOhlcvQuality(env, indexCode, date) {
     minimum_required_count: minimumRequiredCount,
     coverage_rate: Number((coverageRate * 100).toFixed(2)),
     raw_rows: rawRows, unique_tickers: presentSet.size,
-    valid_unique_tickers: validUniqueTickers, invalid_rows: invalidRows,
+    valid_unique_tickers: validUniqueTickers,
+    matched_expected_tickers: matchedExpectedTickers, invalid_rows: invalidRows,
     duplicate_extra_rows: duplicateExtraRows,
     missing_count: missing.length, extra_count: extras.length,
     membership_grace_trading_days: 2,
