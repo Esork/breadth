@@ -35,7 +35,12 @@ function inspectOhlcvCacheDateAgainstCurrentRegistry(targetDate) {
   var universePayload = fetchCloudflareJsonForAdmin_(
     '/api/universe?date=' + encodeURIComponent(dateKey)
   );
-  var eligible = (universePayload.data || []).map(function(item) {
+  if (!universePayload || universePayload.ok !== true ||
+      !Array.isArray(universePayload.data)) {
+    throw new Error('Cloudflare returned an invalid date-specific universe: ' +
+      JSON.stringify(universePayload));
+  }
+  var eligible = universePayload.data.map(function(item) {
     return normalizeTicker_(typeof item === 'string' ? item : item.ticker);
   }).filter(Boolean);
   var eligibleMap = {};
