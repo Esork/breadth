@@ -148,11 +148,13 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
 
   var minimumRequiredCount = Math.ceil(expectedEligibleCount * 0.98);
   var validUniqueTickers = keys.length;
+  // Extras are diagnostic only and must not inflate expected-universe coverage.
+  var matchedExpectedTickers = expectedEligibleCount - missing.length;
   var coverageRate = expectedEligibleCount > 0
-    ? validUniqueTickers / expectedEligibleCount
+    ? matchedExpectedTickers / expectedEligibleCount
     : 0;
   var status = expectedEligibleCount > 0 &&
-    validUniqueTickers >= minimumRequiredCount &&
+    matchedExpectedTickers >= minimumRequiredCount &&
     duplicateExtraRows === 0
       ? 'OK'
       : 'FAIL';
@@ -169,6 +171,7 @@ function inspectLatestOhlcvDateHealthFast_(lookbackRows) {
     coverageRate: Number((coverageRate * 100).toFixed(2)),
     rawRows: rawRows,
     uniqueTickerDates: keys.length,
+    matchedExpectedTickerDates: matchedExpectedTickers,
     invalidRows: invalidRows,
     duplicatePairCount: duplicatePairCount,
     duplicateExtraRows: duplicateExtraRows,
